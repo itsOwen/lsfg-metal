@@ -1,0 +1,48 @@
+[package]
+name = "lsfg-metal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/itsOwen/lsfg-metal"
+readme = "README.md"
+description = "Lossless Scaling frame generation for Wine games on macOS (MoltenVK shim + Metal front end)"
+
+# no bench or bin test harnesses: with panic = "abort" those unwind builds would produce a second lib with the same file name
+[lib]
+crate-type = ["cdylib", "rlib"]
+bench = false
+
+[[bin]]
+name = "validate"
+test = false
+bench = false
+
+[[bin]]
+name = "shader-check"
+test = false
+bench = false
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["std", "debug"] }
+libloading = "0.8"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLTexture", "MTLCommandBuffer", "MTLCommandQueue", "MTLEvent", "MTLDrawable", "MTLResource", "MTLPixelFormat", "MTLBuffer", "MTLBlitCommandEncoder", "MTLCommandEncoder", "MTLTypes", "block2"] }
+objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "CALayer", "objc2-metal", "objc2-core-graphics"] }
+objc2-core-graphics = { version = "0.3", features = ["CGColorSpace"] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+block2 = "0.6"
+
+[profile.release]
+opt-level = 3
+strip = "debuginfo"
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[dev-dependencies]
+# mtlclear renders through a pass descriptor; the shim itself only blits
+objc2-metal = { version = "0.3", features = ["MTLRenderPass", "MTLRenderCommandEncoder"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSWindow", "NSView", "NSResponder", "NSGraphics", "NSRunningApplication", "objc2-quartz-core"] }
