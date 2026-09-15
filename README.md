@@ -1,7 +1,20 @@
-# lsfg-metal
+# lsfg-metal (BETA)
 
 Lossless Scaling frame generation for Wine games on macOS: a MoltenVK shim plus a Metal front end,
 independent Rust implementation, MIT.
+
+**This is a very early release.** It does what it claims: 2x, 3x and 4x hold their exact cadence
+with no dropped or duplicated frames, on the Vulkan path and the Metal path, verified in real games
+through Steam. It has also only ever run on one Apple Silicon Mac, a handful of titles and a single
+60 Hz display. Everything outside that is untested, so expect rough edges on hardware, games and
+refresh rates it has never seen. A bug report with a log attached is worth more than a star.
+
+There is plenty left to do: wider game coverage, high-refresh and multi-display pacing, HDR10, and
+a proper look at why 4x stops scaling once presentation is uncapped.
+
+P.S. It is MIT on purpose. Fork it, vendor it, ship it inside your own launcher, or lift whichever
+parts are useful and throw away the rest. Keep the licence notice and otherwise do whatever you
+like with it. If you build something good on top of this, I would genuinely like to see it.
 
 ## Status
 
