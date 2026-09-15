@@ -11,6 +11,7 @@ Two hooks cover the renderers a Wine bottle can use:
 |---|---|
 | DXVK | Vulkan hook (the shim stands in for `libMoltenVK.dylib`) |
 | vkd3d-proton | Vulkan hook |
+| WineD3D on its Vulkan renderer | Vulkan hook |
 | DXMT | Metal hook (`CAMetalLayer` presentation) |
 | D3DMetal | Metal hook |
 
@@ -84,7 +85,7 @@ Manual setup, without a launcher:
 mkdir -p ~/lsfg && cp dist/renderers/lsfg/libMoltenVK.dylib ~/lsfg/
 ln -sf /path/to/real/libMoltenVK.dylib ~/lsfg/libMoltenVK.real.dylib
 
-# Vulkan path (DXVK, vkd3d-proton)
+# Vulkan path (DXVK, vkd3d-proton, WineD3D on Vulkan)
 export DYLD_LIBRARY_PATH="$HOME/lsfg:$DYLD_LIBRARY_PATH"
 
 # Metal path (DXMT, D3DMetal)
@@ -448,10 +449,6 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
 
 ## Limitations
 
-* WineD3D's Vulkan renderer is not covered. On Wine 10.0 (Sikarugir) it queries
-  `vkGetPhysicalDeviceSurface*` but never calls `vkCreateSwapchainKHR`: it presents through
-  `winemac.drv` rather than a Vulkan swapchain, so there is nothing to wrap and frame generation
-  never engages. DXVK and vkd3d-proton are unaffected.
 * HDR10 and PQ are not supported. HDR means linear `RGBA16F` in extended linear sRGB and nothing
   else; a PQ or HDR10 swapchain or layer keeps native presentation.
 * Multi-GPU Intel Macs are not handled. The Metal front end's private backend takes the first
