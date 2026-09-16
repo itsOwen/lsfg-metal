@@ -286,43 +286,18 @@ pub(crate) fn import_event(
 }
 
 // texture -> image; the caller's chain rides on the import structure
+// an imported metal texture is already backed by memory: the spec treats the image as bound, so no allocation
 pub(crate) fn import_texture(
-    instance: &ash::Instance,
-    pd: vk::PhysicalDevice,
     device: &ash::Device,
     texture: &ProtocolObject<dyn MTLTexture>,
     mut info: vk::ImageCreateInfo,
-) -> Result<(vk::Image, vk::DeviceMemory), String> {
+) -> Result<vk::Image, String> {
     let mut imp = vk::ImportMetalTextureInfoEXT::default()
         .plane(vk::ImageAspectFlags::PLANE_0)
         .mtl_texture(texture as *const _ as *mut c_void);
     imp.p_next = info.p_next;
     info.p_next = &imp as *const _ as *const c_void;
-    unsafe {
-        let image = check(device.create_image(&info, None), "vkCreateImage")?;
-        let req = device.get_image_memory_requirements(image);
-        let bound = vkutil::allocate(
-            instance,
-            pd,
-            device,
-            req.size,
-            req.memory_type_bits,
-            false,
-            None,
-        )
-        .and_then(|mem| {
-            check(device.bind_image_memory(image, mem, 0), "vkBindImageMemory")
-                .map(|_| mem)
-                .inspect_err(|_| device.free_memory(mem, None))
-        });
-        match bound {
-            Ok(mem) => Ok((image, mem)),
-            Err(e) => {
-                device.destroy_image(image, None);
-                Err(e)
-            }
-        }
-    }
+    check(unsafe { device.create_image(&info, None) }, "vkCreateImage")
 }
 
 pub(crate) fn image_info(
@@ -350,8 +325,7 @@ pub(crate) fn image_info(
 // ---- backend ----
 
 struct Backend {
-    instance: ash::Instance,
-    pd: vk::PhysicalDevice,
+    _instance: ash::Instance,
     device: ash::Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
@@ -478,9 +452,8 @@ impl Backend {
             }
         })();
         match built {
-            Ok((pd, device, queue, pool, inst)) => Ok(Backend {
-                instance,
-                pd,
+            Ok((_, device, queue, pool, inst)) => Ok(Backend {
+                _instance: instance,
                 device,
                 queue,
                 pool,
@@ -563,6 +536,7 @@ impl Wrapper {
         src: vk::Image,
         wait: (vk::Semaphore, u64),
         inserted: u32,
+        signal: (vk::Semaphore, u64),
     ) -> Result<(), String> {
         let d = &b.device;
         if self.iteration != 0 {
@@ -629,7 +603,7 @@ impl Wrapper {
         } else {
             vk::Fence::null()
         };
-        b.submit(&[cb], &[wait], &[(self.sync, self.sync_counter + 1)], fence)?;
+        b.submit(&[cb], &[wait], &[(self.sync, self.sync_counter + 1), signal], fence)?;
         self.in_flight = true;
         self.ctx.dispatch(inserted, false)?;
         self.remaining = inserted;
@@ -654,6 +628,7 @@ impl Wrapper {
         cb: vk::CommandBuffer,
         target: vk::Image,
         ts: f64,
+        signal: (vk::Semaphore, u64),
     ) -> Result<(), String> {
         let d = &b.device;
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as P};
@@ -710,10 +685,11 @@ impl Wrapper {
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
         let waits = [(self.sync, self.sync_counter + 1)];
-        let signals: Vec<_> = (self.remaining > 1)
+        let mut signals: Vec<_> = (self.remaining > 1)
             .then_some((self.sync, self.sync_counter + 2))
             .into_iter()
             .collect();
+        signals.push(signal);
         if !self.generated {
             self.ctx.acquire(false, ts as f32)?;
         }
@@ -768,7 +744,6 @@ impl From<&str> for Fail {
 struct Import {
     _texture: Texture,
     image: vk::Image,
-    memory: vk::DeviceMemory,
 }
 
 #[derive(Default)]
@@ -841,7 +816,6 @@ impl Worker {
         if let (Some(i), Some(b)) = (self.imports.remove(&key), &self.backend) {
             unsafe {
                 b.device.destroy_image(i.image, None);
-                b.device.free_memory(i.memory, None);
             }
         }
     }
@@ -952,28 +926,20 @@ impl Worker {
             self.extent,
             vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
         );
-        let (image, memory) = import_texture(&b.instance, b.pd, &b.device, texture, info)?;
+        let image = import_texture(&b.device, texture, info)?;
         self.imports.insert(
             key,
             Import {
                 _texture: texture.retain(),
                 image,
-                memory,
             },
         );
         Ok(image)
     }
 
-    fn signal_present(&mut self) -> Result<u64, String> {
+    fn next_serial(&mut self) -> u64 {
         self.present_serial += 1;
-        let (_, present, _) = self.sems.unwrap();
-        self.backend.as_ref().unwrap().submit(
-            &[],
-            &[],
-            &[(present, self.present_serial)],
-            vk::Fence::null(),
-        )?;
-        Ok(self.present_serial)
+        self.present_serial
     }
 
     fn present_event(&self) -> &ProtocolObject<dyn MTLEvent> {
@@ -1017,7 +983,13 @@ impl Worker {
         };
     }
 
-    fn copy(&self, cb: vk::CommandBuffer, src: vk::Image, dst: vk::Image) -> Result<(), String> {
+    fn copy(
+        &self,
+        cb: vk::CommandBuffer,
+        src: vk::Image,
+        dst: vk::Image,
+        signal: (vk::Semaphore, u64),
+    ) -> Result<(), String> {
         let b = self.backend.as_ref().unwrap();
         let d = &b.device;
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as P};
@@ -1047,7 +1019,7 @@ impl Worker {
             vkutil::cmd_blit(d, cb, src, 0, dst, 0, self.extent);
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
-        b.submit(&[cb], &[], &[], vk::Fence::null())
+        b.submit(&[cb], &[], &[signal], vk::Fence::null())
     }
 
     fn next_real(&self, what: &str) -> Result<Drawable, Fail> {
@@ -1097,7 +1069,8 @@ impl Worker {
             0.0
         };
         let source = self.imported(&texture)?;
-        let (game_sem, _, fence) = self.sems.unwrap();
+        let (game_sem, present, fence) = self.sems.unwrap();
+        let copied = self.next_serial();
         let b = self.backend.as_ref().unwrap();
         self.ctx.as_mut().unwrap().dispatch(
             b,
@@ -1105,8 +1078,8 @@ impl Worker {
             source,
             (game_sem, job.serial),
             inserted as u32,
+            (present, copied),
         )?;
-        let copied = self.signal_present()?;
         if self.stats.source == 89 {
             self.dump(&texture, "previous", copied);
         }
@@ -1118,9 +1091,12 @@ impl Worker {
             let target = self.next_real("no drawable for a generated frame")?;
             let ttex = target.texture();
             let timg = self.imported(&ttex)?;
+            let ready = self.next_serial();
             let (b, cb) = (self.backend.as_ref().unwrap(), self.cmd[1 + i]);
-            self.ctx.as_mut().unwrap().acquire(b, cb, timg, slot)?;
-            let ready = self.signal_present()?;
+            self.ctx
+                .as_mut()
+                .unwrap()
+                .acquire(b, cb, timg, slot, (present, ready))?;
             if self.stats.source == 90 {
                 self.dump(&ttex, &format!("generated{i}"), ready);
             }
@@ -1133,8 +1109,8 @@ impl Worker {
         if show_original {
             let target = self.next_real("no drawable for the original frame")?;
             let timg = self.imported(&target.texture())?;
-            self.copy(self.cmd[1 + inserted], source, timg)?;
-            let ready = self.signal_present()?;
+            let ready = self.next_serial();
+            self.copy(self.cmd[1 + inserted], source, timg, (present, ready))?;
             forward_presented(job.drawable.clone(), &target);
             self.present_when_ready(&target, duration, ready)?;
             self.retire(job.drawable.clone(), ready);

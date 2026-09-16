@@ -67,7 +67,7 @@ pub struct ProxySwapchain {
     layer: Retained<CAMetalLayer>,
     extent: (u32, u32),
     textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
-    images: Vec<(vk::Image, vk::DeviceMemory)>,
+    images: Vec<vk::Image>,
     ready: vk::Semaphore,
     state: Arc<(Mutex<State>, Condvar)>,
 }
@@ -158,13 +158,7 @@ impl ProxySwapchain {
                 .sharing_mode(info.image_sharing_mode)
                 .queue_family_indices(families);
                 ci.p_next = info.p_next;
-                images.push(import_texture(
-                    &game.instance,
-                    game.physical_device,
-                    &game.device,
-                    &t,
-                    ci,
-                )?);
+                images.push(import_texture(&game.device, &t, ci)?);
                 textures.push(t);
             }
             import_event(&game.device, gen.game_event())
@@ -172,10 +166,9 @@ impl ProxySwapchain {
         let ready = match built {
             Ok(r) => r,
             Err(e) => {
-                for (i, m) in images {
+                for i in images {
                     unsafe {
                         game.device.destroy_image(i, None);
-                        game.device.free_memory(m, None);
                     }
                 }
                 return Err(e);
@@ -217,8 +210,8 @@ impl ProxySwapchain {
                 return vk::Result::SUCCESS;
             }
             let want = (*p_count).min(n);
-            for (i, (img, _)) in self.images.iter().take(want as usize).enumerate() {
-                *p_images.add(i) = *img;
+            for (i, &img) in self.images.iter().take(want as usize).enumerate() {
+                *p_images.add(i) = img;
             }
             *p_count = want;
         }
@@ -432,9 +425,8 @@ impl Drop for ProxySwapchain {
         drop(s);
         self.gen.forget(std::mem::take(&mut self.textures));
         unsafe {
-            for (i, mem) in self.images.drain(..) {
+            for i in self.images.drain(..) {
                 self.game.device.destroy_image(i, None);
-                self.game.device.free_memory(mem, None);
             }
             self.game.device.destroy_semaphore(self.ready, None);
         }
