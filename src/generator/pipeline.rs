@@ -35,7 +35,7 @@ pub struct Pipeline {
     pipelines: Vec<vk::Pipeline>,
     cmd_pool: vk::CommandPool,
     pub cmd: [vk::CommandBuffer; 2],
-    params: HashMap<u64, vk::CommandBuffer>,
+    params: HashMap<u64, (vk::CommandBuffer, f32)>,
     pub source: vk::Image,
     pub destination: vk::Image,
 }
@@ -625,46 +625,22 @@ impl Pipeline {
                 )
             };
         }
-        use vk::AccessFlags2 as AF;
-        let mut pending: HashMap<vk::Image, (usize, AF, AF)> = HashMap::new();
         for (st, tab) in tabs.iter().enumerate() {
             let cb = self.cmd[(st >= self.sig.split) as usize];
-            for (list, access) in [
-                (&tab.sampled, AF::SHADER_READ),
-                (&tab.stored, AF::SHADER_WRITE),
-            ] {
-                for &i in list {
-                    for &h in &self.imgs[i].handles {
-                        pending.entry(h).and_modify(|e| e.2 = access).or_insert((
-                            i,
-                            AF::NONE,
-                            access,
-                        ));
-                    }
-                }
+            // every image stays in general layout, so one global write -> read|write barrier per stage covers them all
+            if st != 0 && st != self.sig.split {
+                let b = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+                unsafe {
+                    inst.sync2.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().memory_barriers(&b),
+                    )
+                };
             }
-            // "no layout change" is expressed as general -> general, which is valid vulkan and equally a no-op
-            let barriers: Vec<vk::ImageMemoryBarrier2> = pending
-                .iter()
-                .map(|(&h, &(i, src, dst))| {
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .src_access_mask(src)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .dst_access_mask(dst)
-                        .old_layout(vk::ImageLayout::GENERAL)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .image(h)
-                        .subresource_range(vkutil::color_range(0, self.imgs[i].layers))
-                })
-                .collect();
-            unsafe {
-                inst.sync2.cmd_pipeline_barrier2(
-                    cb,
-                    &vk::DependencyInfo::default().image_memory_barriers(&barriers),
-                )
-            };
-            pending.clear();
             for (sh, passes) in &tab.subs {
                 unsafe {
                     d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipelines[*sh])
@@ -681,18 +657,6 @@ impl Pipeline {
                             bytes,
                         );
                         d.cmd_dispatch(cb, x, y, 1);
-                    }
-                }
-            }
-            if st + 1 != self.sig.split && st + 1 != tabs.len() {
-                for (list, src) in [
-                    (&tab.sampled, AF::SHADER_READ),
-                    (&tab.stored, AF::SHADER_WRITE),
-                ] {
-                    for &i in list {
-                        for &h in &self.imgs[i].handles {
-                            pending.insert(h, (i, src, AF::SHADER_READ));
-                        }
                     }
                 }
             }
@@ -719,9 +683,15 @@ impl Pipeline {
     ) -> Result<vk::CommandBuffer, String> {
         let d = &self.inst.device;
         let key = index as u64;
-        // the buffer is reset and re-recorded instead of freed and reallocated every call
+        let ts = if timestamp != 0.0 {
+            timestamp
+        } else {
+            (index + 1) as f32 / (total + 1) as f32
+        };
+        // the same timestamp resubmits the recorded buffer; a new one resets and re-records it
         let cb = match self.params.get(&key) {
-            Some(&cb) => {
+            Some(&(cb, t)) if t == ts => return Ok(cb),
+            Some(&(cb, _)) => {
                 check(
                     unsafe { d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) },
                     "vkResetCommandBuffer",
@@ -730,12 +700,7 @@ impl Pipeline {
             }
             None => vkutil::allocate_command_buffer(d, self.cmd_pool)?,
         };
-        let ts = if timestamp != 0.0 {
-            timestamp
-        } else {
-            (index + 1) as f32 / (total + 1) as f32
-        };
-        vkutil::begin(d, cb, vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)?;
+        vkutil::begin(d, cb, vk::CommandBufferUsageFlags::empty())?;
         let barrier = |ss, sa, ds, da| {
             [vk::BufferMemoryBarrier2::default()
                 .src_stage_mask(ss)
@@ -771,7 +736,7 @@ impl Pipeline {
             );
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
-        self.params.insert(key, cb);
+        self.params.insert(key, (cb, ts));
         Ok(cb)
     }
 }
