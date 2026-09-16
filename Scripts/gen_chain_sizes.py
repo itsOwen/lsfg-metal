@@ -3,6 +3,8 @@
 # usage: gen_chain_sizes.py <Vulkan-Headers dir with include/vulkan and registry/vk.xml>
 import os, re, subprocess, sys, tempfile
 import xml.etree.ElementTree as ET
+if len(sys.argv) != 2:
+    sys.exit('usage: gen_chain_sizes.py <Vulkan-Headers dir with include/vulkan and registry/vk.xml>')
 hdrs = sys.argv[1]
 inc = os.path.join(hdrs, 'include')
 core = open(os.path.join(inc, 'vulkan', 'vulkan_core.h')).read()

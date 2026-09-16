@@ -771,8 +771,9 @@ unsafe extern "system" fn create_instance(
         error!("- {what}");
         vk::Result::ERROR_INITIALIZATION_FAILED
     };
-    let hooked = has_name(&exts, khr::surface::NAME);
-    let r = if hooked {
+    let mut hooked = has_name(&exts, khr::surface::NAME);
+    let mut r = vk::Result::ERROR_INITIALIZATION_FAILED;
+    if hooked {
         info!("Intercepting instance creation");
         let mut list = exts.clone();
         add_name(&mut list, khr::get_physical_device_properties2::NAME);
@@ -781,18 +782,19 @@ unsafe extern "system" fn create_instance(
         let mut mci = *ci;
         mci.pp_enabled_extension_names = list.as_ptr();
         mci.enabled_extension_count = list.len() as u32;
-        let r = real(&mci, alloc, out);
+        r = real(&mci, alloc, out);
         if r != vk::Result::SUCCESS {
-            return fail(&format!("vkCreateInstance failed: {r:?}"));
+            // the game's own request must still work; only generation is lost
+            warn!("Intercepted vkCreateInstance failed ({r:?}); passing through");
+            hooked = false;
         }
-        r
-    } else {
-        let r = real(info, alloc, out);
+    }
+    if !hooked {
+        r = real(info, alloc, out);
         if r != vk::Result::SUCCESS {
             return r;
         }
-        r
-    };
+    }
     let instance = *out;
     match register_instance(drv, instance, hooked) {
         Ok(()) => r,
@@ -1180,16 +1182,13 @@ unsafe fn choose_wrapper(
 ) -> Result<(Created, bool), Error> {
     let h = dev.hook.as_ref().expect("hooked device");
     let profile = layer().expect("active layer").profile();
-    let mut ci = *ci;
-    // a proxy handle is ours, the driver must never see it
-    if proxy::is_proxy(ci.old_swapchain) {
-        ci.old_swapchain = vk::SwapchainKHR::null();
-    }
+    // multiplier 1 generates nothing, so the fixed path's plain forwarding is the right shape for it
     if h.proxy_supported.load(Ordering::Relaxed)
+        && profile.multiplier > 1
         && profile.pacing_mode == settings::PacingMode::Adaptive
         && settings::os_env("LSFGM_VULKAN_PROXY").as_deref() != Some("0")
     {
-        match proxy::create(dev, &ci) {
+        match proxy::create(dev, ci) {
             Ok(Some(created)) => return Ok((created, true)),
             Ok(None) => {}
             Err(e) => {
@@ -1198,7 +1197,7 @@ unsafe fn choose_wrapper(
             }
         }
     }
-    let f = fixed::Fixed::create(dev.clone(), &ci, caps, real, alloc)?;
+    let f = fixed::Fixed::create(dev.clone(), ci, caps, real, alloc)?;
     let sc = f.swapchain;
     Ok(((sc, Box::new(f)), false))
 }
@@ -1223,7 +1222,12 @@ unsafe extern "system" fn create_swapchain(
     else {
         return fail("Could not resolve vkCreateSwapchainKHR");
     };
-    let ci = &*info;
+    // a proxy handle is ours, the driver must never see it on either branch below
+    let mut ci = *info;
+    if proxy::is_proxy(ci.old_swapchain) {
+        ci.old_swapchain = vk::SwapchainKHR::null();
+    }
+    let ci = &ci;
     let (sc, wrapper, is_proxy) = match dev.hook.as_ref().and_then(|h| supported(h, ci)) {
         Some(caps) => match choose_wrapper(&dev, ci, &caps, real, alloc) {
             Ok(((sc, w), p)) => (sc, Some(w), p),
@@ -1237,7 +1241,7 @@ unsafe extern "system" fn create_swapchain(
         },
         None => {
             let mut sc = vk::SwapchainKHR::null();
-            let r = real(device, info, alloc, &mut sc);
+            let r = real(device, ci, alloc, &mut sc);
             if r != vk::Result::SUCCESS {
                 return r;
             }
@@ -1252,7 +1256,9 @@ unsafe extern "system" fn create_swapchain(
     let Some(present) = dfetch::<vk::PFN_vkQueuePresentKHR>(dev.gdpa, device, c"vkQueuePresentKHR")
     else {
         drop(wrapper);
-        destroy(device, sc, alloc);
+        if !is_proxy {
+            destroy(device, sc, alloc);
+        }
         return fail("Could not resolve vkQueuePresentKHR");
     };
     *out = sc;

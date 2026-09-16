@@ -1,11 +1,5 @@
 [build]
 target = "x86_64-apple-darwin"
 
-# the shim stands in for the driver, so it must carry the driver's install name, not a build path
-# objc2's class statics stay exported: rustc owns the export list for a cdylib and a second
-# -exported_symbol flag makes ld refuse the link. only the four vulkan functions are ever dlsym'd
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-Wl,-install_name,@rpath/libMoltenVK.dylib"]
-
 [env]
 MACOSX_DEPLOYMENT_TARGET = "11.0"

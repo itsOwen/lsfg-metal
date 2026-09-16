@@ -167,7 +167,12 @@ impl Generator {
         );
         let mut pool = self.pool.lock().unwrap();
         while pool.outstanding >= 3 {
-            pool = self.pool_cv.wait(pool).unwrap();
+            // like the real layer's one-second nextDrawable timeout: the caller gets a real drawable
+            let (p, r) = self.pool_cv.wait_timeout(pool, Duration::from_secs(1)).unwrap();
+            pool = p;
+            if r.timed_out() && pool.outstanding >= 3 {
+                return None;
+            }
         }
         pool.textures
             .retain(|t| t.width() == w && t.height() == h && t.pixelFormat() == format);
@@ -199,10 +204,13 @@ impl Generator {
     fn send(&'static self, msg: Msg) {
         self.started.call_once(|| {
             let rx = self.rx.lock().unwrap().take().unwrap();
-            std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("lsfg-metal".into())
-                .spawn(move || Worker::new(self).run(rx))
-                .expect("worker thread");
+                .spawn(move || autoreleasepool(|_| Worker::new(self)).run(rx));
+            if let Err(e) = spawned {
+                log::error(&format!("cannot start the Metal presentation worker: {e}"));
+                set_enabled(false);
+            }
         });
         // the worker is gone: no more generation, show this frame ourselves
         if let Err(SendError(Msg::Job(job))) = self.tx.send(msg) {
@@ -819,17 +827,7 @@ impl Worker {
         hooks::mark_worker();
         for msg in rx {
             autoreleasepool(|_| match msg {
-                Msg::Job(mut job) => {
-                    // panic = abort makes this a no-op in every profile; the bounded gpu waits carry the load
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.process(&mut job)
-                    }));
-                    if r.is_err() {
-                        log::error("Metal presentation worker panicked, presenting natively from now on");
-                        set_enabled(false);
-                        self.present_natively(&job);
-                    }
-                }
+                Msg::Job(mut job) => self.process(&mut job),
                 Msg::Forget(textures) => {
                     for t in textures {
                         self.forget(Retained::as_ptr(&t) as usize);
@@ -1285,6 +1283,7 @@ fn present_natively(gen: &Generator, job: &Job) -> bool {
         cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*gen.game_event), job.serial);
     }
     let (src, dst) = (job.drawable.texture(), real.texture());
+    // mid-resize the sizes differ: still present (one blank frame) so the layer settles; skipping stalls the game
     if src.width() == dst.width()
         && src.height() == dst.height()
         && src.pixelFormat() == dst.pixelFormat()

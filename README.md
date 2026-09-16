@@ -9,8 +9,10 @@ through Steam. It has also only ever run on one Apple Silicon Mac, a handful of 
 60 Hz display. Everything outside that is untested, so expect rough edges on hardware, games and
 refresh rates it has never seen. A bug report with a log attached is worth more than a star.
 
-There is plenty left to do: wider game coverage, high-refresh and multi-display pacing, HDR10, and
-a proper look at why 4x stops scaling once presentation is uncapped.
+There is plenty left to do: wider game coverage, high-refresh and multi-display pacing, and HDR10.
+One ceiling is the platform's, not a bug: MoltenVK caps a swapchain at 3 images and CoreAnimation
+returns one drawable per refresh, so with vsync released a 60 Hz panel tops out at 60·m/(m−1)
+presented fps (120 at 2x, 80 at 4x); a 120 Hz panel doubles that.
 
 P.S. It is MIT on purpose. Fork it, vendor it, ship it inside your own launcher, or lift whichever
 parts are useful and throw away the rest. Keep the licence notice and otherwise do whatever you
@@ -128,7 +130,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_FLOW_SCALE` | flow resolution scale | float, 0.25 to 1.0 | 1.0 |
 | `LSFGM_PERFORMANCE_MODE` | use the performance shader set | `1` is true, any other non-empty value is false | false |
 | `LSFGM_PACING_MODE` | pacing | `vsync` or `none` (fixed), `adaptive`; matched case-insensitively | `vsync` |
-| `LSFGM_OVERRIDE_PRESENT_MODE` | force FIFO on wrapped swapchains | `1` is true, other non-empty is false | true |
+| `LSFGM_OVERRIDE_PRESENT_MODE` | force vsync: FIFO on wrapped swapchains, `displaySyncEnabled` on Metal layers; `0` leaves the game's own present mode and display sync in place on every path | `1` is true, other non-empty is false | true |
 | `LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT` | keep the game's image count | `1` is true, other non-empty is false | false |
 | `LSFGM_DLL_PATH` | path to `lsfg-vk.dll` | path | unset, see discovery below |
 | `LSFGM_NO_FP16` | disable half precision | `allow_fp16 = (value != "1")` | unset, fp16 allowed |
@@ -148,9 +150,19 @@ library builds one profile named `(environment)` from the variables below and us
 Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_STATS` and
 `LSFGM_PACE_DEBUG`. Every other variable is read by value and is only honoured when non-empty.
 
+The boolean variables do not share one truth rule: the profile flags are true only for `1`,
+`LSFGM_NO_FP16` disables fp16 only for `1`, and `LSFGM_METAL` and `LSFGM_VULKAN_PROXY` are on for
+anything but `0`. `LSFGM_PERFORMANCE_MODE=true` therefore means false.
+
+In file mode only `LSFGM_DLL_PATH`, `LSFGM_NO_FP16`, `LSFGM_LOG_LEVEL` and `LSFGM_LOG_FILE` are read;
+they override the file's `[global]` values, also after a reload. The profile variables
+(`LSFGM_MULTIPLIER` through `LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT`) are ignored without `LSFGM_ENV`.
+`~` is not expanded in any environment variable; only the file's `dll` and `log_file` get that.
+
 Also consulted: `XDG_CONFIG_HOME` and `HOME` for the config path; `SteamAppId` for profile
 selection; `HOME` and `WINEPREFIX` for DLL discovery; `HOME` and `XDG_CACHE_HOME` for the pipeline
-cache directory.
+cache directory (`$XDG_CACHE_HOME/lsfg-metal`, else `~/Library/Caches/lsfg-metal`, files
+`cache_{quality|performance}_<driver uuid>.bin`).
 
 There is no `LSFGM_HDR`. HDR is decided by the swapchain or layer format and color space, not by a
 variable.
@@ -177,25 +189,36 @@ If the chosen file does not exist and `LSFGM_CONFIG` was set, loading fails with
 `LSFGM_CONFIG is set but file does not exist: <path>`. Otherwise the built-in default file is
 written to that path (creating parent directories) and used.
 
+Any configuration error in either mode (unparseable file, bad value, unwritable default path) is
+logged as `lsfg-metal shim: failed to initialize, passing through:` followed by `- <error>`, and the
+shim stays passive: no defaults, no generation, and never an abort of the game. The one exception is
+`LSFGM_LOG_LEVEL`: an unrecognised level is a warning and the configured level is kept. A file that
+breaks later, while the game runs, is different again: the reload keeps the previous profile and
+warns `Keeping the previous frame-generation profile: <error>`.
+
 ```toml
+# active_in lists Steam App IDs ($SteamAppId), not executable names
 version = 2
 
 [global]
-dll = "~/Games/Lossless Scaling/lsfg-vk.dll"
 allow_fp16 = true
 log_level = "info"
-# log_file = "~/lsfg.log"
 
 [[profile]]
 name = "Default 2x"
-active_in = "000000"                 # Steam App IDs: a string, or an array of strings
-pacing_mode = "vsync"                # "pacing" is accepted as an alias
+active_in = "000000"
+pacing_mode = "vsync"
 multiplier = 2
 flow_scale = 1.0
 performance_mode = false
 override_present_mode = true
 preserve_swapchain_image_count = false
 ```
+
+`dll` and `log_file` appear in `[global]` only when set (`~` is expanded on read); `active_in` is a
+string for one ID, an array for several, and omitted for none. `pacing` is accepted as an alias for
+`pacing_mode`, a `# comment` after any value is accepted, and a key that appears twice takes the
+last value.
 
 Supported subset of TOML:
 
@@ -226,6 +249,7 @@ Profile selection order:
 
 1. `LSFGM_ENV` set: the synthesised `(environment)` profile, method *environment*.
 2. `LSFGM_PROFILE` non-empty: the profile whose `name` equals it exactly, method *environment*.
+   An unmatched name falls through to step 3.
 3. `SteamAppId` non-empty: the first profile whose `active_in` contains exactly that string,
    method *Steam App ID*.
 4. No match: no profile, and the shim stays passive.
@@ -387,11 +411,21 @@ functions. `objc2`'s class data statics are also exported, and that is expected:
 export list for a `cdylib` and adding a second `-exported_symbol` flag makes the linker refuse the
 link. They are data symbols, not text symbols, which is why the check filters on `T`.
 
+`src/shim/chain_sizes.rs` is generated, not hand-written. It lists the `sType` and `sizeof` of every
+structure that can extend `VkDeviceCreateInfo` in the macOS header set (`vulkan_core.h`,
+`vulkan_metal.h`, `vulkan_beta.h`); the feature-chain copy uses it to duplicate a game's `pNext`
+chain byte for byte. After bumping Vulkan-Headers run `Scripts/gen_chain_sizes.py <Vulkan-Headers
+checkout>` (needs `registry/vk.xml`, `include/vulkan`, `clang` and Python 3). It compiles a throwaway
+program that prints the sizes and overwrites the file; the first line records the header version.
+Review the diff and rebuild.
+
 ## Testing
 
-**Unit tests.** 26 tests, no GPU and no display needed: `cargo test --release`. They cover the pacer
-(trust rule, locking, fractional ratios, cap behaviour, untrusted runs and probing, invalid
-intervals, a closed-loop convergence model), the settings library (environment mode, config path
+**Unit tests.** 27 tests, no GPU and no display needed: `cargo test --release`. Set
+`LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
+that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, cap
+behaviour, untrusted runs and probing, invalid intervals, the hitch floor on a fast display, a
+closed-loop convergence model), the settings library (environment mode, config path
 precedence, TOML round trip and `~` expansion, error messages, profile identification order, reload
 on mtime change), the PE resource walk, the feature-chain copy, memory type selection, the memory
 planner, the pipeline signature tables, the recursive mutex and half-float conversion.

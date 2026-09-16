@@ -6,7 +6,7 @@ use std::sync::{Mutex, Once, OnceLock};
 
 use ash::vk::{self, Handle};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Imp, NSObjectProtocol, ProtocolObject, Sel};
+use objc2::runtime::{AnyObject, Imp, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{define_class, ffi, msg_send, sel, AnyThread, ClassType, DefinedClass, Message};
 use objc2_foundation::NSObject;
 use objc2_core_graphics::{kCGColorSpaceExtendedLinearSRGB, CGColorSpace};
@@ -63,10 +63,6 @@ pub(crate) fn mark_worker() {
     IS_WORKER.with(|w| w.set(true));
 }
 
-unsafe fn swizzle(cls: &AnyClass, sel: Sel, hook: *const ()) -> Option<Imp> {
-    let m = cls.instance_method(sel)?;
-    Some(m.set_implementation(std::mem::transmute::<*const (), Imp>(hook)))
-}
 
 // swizzle nextDrawable once; the command buffer hooks follow on first use
 pub fn install() {
@@ -74,15 +70,16 @@ pub fn install() {
     if NEXT_DRAWABLE.get().is_some() {
         return;
     }
-    if let Some(imp) = unsafe {
-        swizzle(
-            CAMetalLayer::class(),
-            sel!(nextDrawable),
+    let Some(m) = CAMetalLayer::class().instance_method(sel!(nextDrawable)) else {
+        return;
+    };
+    // publish the original before swapping: a caller racing the swap must find it
+    let _ = NEXT_DRAWABLE.set(unsafe { std::mem::transmute::<Imp, NextDrawableFn>(m.implementation()) });
+    unsafe {
+        m.set_implementation(std::mem::transmute::<*const (), Imp>(
             next_drawable_hook as *const (),
-        )
-    } {
-        let _ = NEXT_DRAWABLE.set(unsafe { std::mem::transmute::<Imp, NextDrawableFn>(imp) });
-    }
+        ))
+    };
 }
 
 // probe a command buffer of the layer's device (or the default device) and hook its concrete class
@@ -119,18 +116,18 @@ pub(crate) fn install_cb_hooks(layer: &CAMetalLayer) {
     else {
         return;
     };
+    // publish the originals before swapping: a commit racing the swap must find them
+    let imp: Vec<Imp> = methods.iter().map(|m| m.implementation()).collect();
     unsafe {
-        let imp: Vec<Imp> = methods
-            .iter()
-            .zip(hooks)
-            .map(|(m, h)| m.set_implementation(std::mem::transmute::<*const (), Imp>(h)))
-            .collect();
         let _ = CB_HOOKS.set(CbHooks {
             present: std::mem::transmute::<Imp, PresentFn>(imp[0]),
             present_min: std::mem::transmute::<Imp, PresentTimedFn>(imp[1]),
             present_at: std::mem::transmute::<Imp, PresentTimedFn>(imp[2]),
             commit: std::mem::transmute::<Imp, CommitFn>(imp[3]),
         });
+        for (m, h) in methods.iter().zip(hooks) {
+            m.set_implementation(std::mem::transmute::<*const (), Imp>(h));
+        }
     }
     log::info(&format!(
         "Metal presentation hooks installed on {}",
@@ -228,7 +225,7 @@ unsafe extern "C-unwind" fn next_drawable_hook(
 ) -> *mut AnyObject {
     let layer = &*this;
     INIT.call_once(|| {
-        if super::setup().is_some() {
+        if super::setup().is_some_and(|s| s.profile.multiplier > 1) {
             set_enabled(true);
             log::info("lsfg-metal metal front end active");
         }
@@ -238,7 +235,10 @@ unsafe extern "C-unwind" fn next_drawable_hook(
         if layer.maximumDrawableCount() < 3 {
             layer.setMaximumDrawableCount(3);
         }
-        if !layer.displaySyncEnabled() {
+        // vsync mode presents on refresh; with the override off the game's own setting stands
+        if super::setup().is_some_and(|s| s.profile.override_present_mode)
+            && !layer.displaySyncEnabled()
+        {
             layer.setDisplaySyncEnabled(true);
         }
         // the worker blits into the real drawables
@@ -351,6 +351,6 @@ unsafe extern "C-unwind" fn commit_hook(this: *mut AnyObject, sel: Sel) {
         None => orig(this, sel),
     }
     if !IS_WORKER.with(|w| w.get()) {
-        LAST_COMMITTED.with(|c| *c.borrow_mut() = Some(cb.retain()));
+        let _ = LAST_COMMITTED.try_with(|c| *c.borrow_mut() = Some(cb.retain()));
     }
 }

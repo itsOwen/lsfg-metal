@@ -35,7 +35,24 @@ pub struct Fixed {
     ctx: Option<context::Wrapper>,
     failed: bool,
     warned: bool,
+    warned_mode: bool,
     stats: Option<(u64, u64)>,
+    // created FIFO under override_present_mode: the inner presents stay in that mode too
+    forced_fifo: bool,
+}
+
+// the mode the game selected for this present through VK_EXT_swapchain_maintenance1, if any
+unsafe fn present_mode_of(p_next: *const std::ffi::c_void) -> Option<vk::PresentModeKHR> {
+    let mut p = p_next.cast::<vk::BaseInStructure>();
+    while !p.is_null() {
+        if (*p).s_type == vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT {
+            let s = &*p.cast::<vk::SwapchainPresentModeInfoEXT>();
+            return (s.swapchain_count >= 1 && !s.p_present_modes.is_null())
+                .then(|| *s.p_present_modes);
+        }
+        p = (*p).p_next;
+    }
+    None
 }
 
 fn ok(r: vk::Result) -> bool {
@@ -73,6 +90,10 @@ impl Fixed {
         if r != vk::Result::SUCCESS {
             return Err(Error::Vk(r));
         }
+        log::info(&format!(
+            "Wrapped swapchain: present mode {:?} (game asked {:?}), {} images (game asked {})",
+            ci.present_mode, info.present_mode, ci.min_image_count, info.min_image_count
+        ));
         let hdr = ci.image_format == vk::Format::R16G16B16A16_SFLOAT
             && ci.image_color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT;
         let mut f = Fixed {
@@ -87,7 +108,9 @@ impl Fixed {
             ctx: None,
             failed: false,
             warned: false,
+            warned_mode: false,
             stats: std::env::var_os("LSFGM_STATS").map(|_| (0, 0)),
+            forced_fifo: profile.override_present_mode,
         };
         let mut setup = || -> Result<(), String> {
             f.images = vkutil::check(
@@ -170,8 +193,8 @@ impl Fixed {
         }
     }
 
-    // present preamble: config reload, context (re)creation; (revision changed, multiplier)
-    fn preamble(&mut self) -> (bool, u32) {
+    // present preamble: config reload, context (re)creation; returns the multiplier
+    fn preamble(&mut self) -> u32 {
         let layer = layer().expect("active layer");
         if let Err(e) = layer.update() {
             log::warn(&format!(
@@ -210,7 +233,7 @@ impl Fixed {
                 }
             }
         }
-        (changed, m)
+        m
     }
 
     unsafe fn run(
@@ -253,8 +276,19 @@ impl Fixed {
                 Err(Error::Vk(r))
             }
         };
+        // generated frames follow the mode the game chose for this present, not the created mode
+        let game_mode = if self.forced_fifo { None } else { present_mode_of(info.p_next) };
+        if let Some(mode) = game_mode.filter(|_| !self.warned_mode) {
+            self.warned_mode = true;
+            log::info(&format!("Game selects present mode {mode:?} per present; generated frames follow it"));
+        }
+        let modes = [game_mode.unwrap_or_default()];
+        let inner_info =
+            game_mode.map(|_| vk::SwapchainPresentModeInfoEXT::default().present_modes(&modes));
+        let inner_next: *const std::ffi::c_void =
+            inner_info.as_ref().map_or(std::ptr::null(), |n| std::ptr::from_ref(n).cast());
         for i in 0..inserted as usize {
-            let inner = self.inner[i];
+            let inner = *self.inner.get(i).ok_or("Inner pass missing")?;
             let (idx, _) = hook
                 .swapchain
                 .acquire_next_image(swapchain, 1_000_000_000, inner.acquire, vk::Fence::null())
@@ -273,7 +307,7 @@ impl Fixed {
                 &signals,
                 (i + 1) as f32 / m as f32,
             )?;
-            let _ = present(&[inner.copy], idx, std::ptr::null())?;
+            let _ = present(&[inner.copy], idx, inner_next)?;
             self.count(false);
         }
         let r = present(&[pass.present], index as u32, info.p_next)?;
@@ -314,13 +348,12 @@ impl Swapchain for Fixed {
             }
             return Ok(r);
         }
-        let (changed, m) = self.preamble();
+        let m = self.preamble();
         if self.ctx.is_none() {
             return Ok(real(queue, info));
         }
-        if changed {
-            self.grow(m.saturating_sub(1) as usize)?;
-        }
+        // a no-op once sized; unconditional so a failed grow is retried instead of indexed past
+        self.grow(m.saturating_sub(1) as usize)?;
         let mut ctx = self.ctx.take().expect("context");
         match self.run(&mut ctx, m, queue, info, real) {
             Ok(r) => {

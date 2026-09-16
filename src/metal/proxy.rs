@@ -104,11 +104,15 @@ impl ProxySwapchain {
         let Some(format) = super::mtl_format(info.image_format) else {
             return Ok(None);
         };
-        super::setup().ok_or("no active frame-generation profile")?;
+        let setup = super::setup().ok_or("no active frame-generation profile")?;
         hooks::install();
         hooks::install_cb_hooks(&layer);
         set_enabled(true);
-        layer.setDisplaySyncEnabled(true);
+        let vsync = matches!(
+            info.present_mode,
+            vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+        );
+        layer.setDisplaySyncEnabled(setup.profile.override_present_mode || vsync);
         let gen = Generator::get(&layer).ok_or("no Metal device for the layer")?;
         let count = info.min_image_count.max(3) as usize;
         let extent = (info.image_extent.width, info.image_extent.height);

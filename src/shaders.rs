@@ -199,6 +199,9 @@ impl Library {
             fp16,
         };
         let mut make = |name: &'static str, perf: bool, words: &[u32]| -> Result<(), String> {
+            if words.len() < 5 || words[0] != 0x0723_0203 {
+                return Err(format!("Shader '{name}' in the DLL is not SPIR-V"));
+            }
             let info = vk::ShaderModuleCreateInfo::default().code(words);
             let m = check(
                 unsafe { device.create_shader_module(&info, None) },

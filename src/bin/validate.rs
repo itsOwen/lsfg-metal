@@ -142,7 +142,7 @@ fn run() -> Result<(), String> {
         inst.physical_device,
         d,
         usage,
-        &vec![0u8; (w * h * bpp) as usize],
+        &vec![0u8; w as usize * h as usize * bpp as usize],
     )?;
     let cb = vkutil::allocate_command_buffer(d, pool)?;
     cbs.push(cb);
@@ -174,7 +174,7 @@ fn run() -> Result<(), String> {
             d.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()),
             "vkMapMemory",
         )? as *const u8;
-        let off = ((h / 2 * w + w / 2) * bpp) as usize;
+        let off = (h as usize / 2 * w as usize + w as usize / 2) * bpp as usize;
         let px = std::slice::from_raw_parts(p.add(off), bpp as usize).to_vec();
         d.unmap_memory(mem);
         d.destroy_fence(fence, None);
@@ -199,7 +199,7 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
-    log::set_level(if env("LSFGM_LOG_LEVEL").as_deref() == Some("debug") {
+    log::set_level(if env("LSFGM_LOG_LEVEL").is_some_and(|l| l.eq_ignore_ascii_case("debug")) {
         log::Level::Debug
     } else {
         log::Level::Info

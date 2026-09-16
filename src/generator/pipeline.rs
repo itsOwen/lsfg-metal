@@ -461,7 +461,6 @@ impl Pipeline {
                 vec![]
             }
         };
-        let mut valid = data.len() > 32;
         let info = vk::PipelineCacheCreateInfo::default().initial_data(&data);
         self.cache = match unsafe { d.create_pipeline_cache(&info, None) } {
             Ok(c) => c,
@@ -470,7 +469,6 @@ impl Pipeline {
                 crate::log::warn(&format!(
                     "Pipeline cache file is corrupt ({e:?}), rebuilding it"
                 ));
-                valid = false;
                 let empty = vk::PipelineCacheCreateInfo::default();
                 check(
                     unsafe { d.create_pipeline_cache(&empty, None) },
@@ -517,15 +515,19 @@ impl Pipeline {
                 return Err(format!("vkCreateComputePipelines failed: {e:?}"));
             }
         }
-        if let Some(path) = path.filter(|_| !valid) {
+        if let Some(path) = path {
             let bytes = check(
                 unsafe { d.get_pipeline_cache_data(self.cache) },
                 "vkGetPipelineCacheData",
             )?;
-            // write to a temporary file and rename so a crash never leaves a truncated cache behind
-            let tmp = path.with_extension("tmp");
-            if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
-                crate::log::warn(&format!("Could not save pipeline cache file: {e}"));
+            // rewrite when the driver's data changed; per-process temp name so two contexts do not interleave
+            if bytes != data {
+                let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+                if let Err(e) =
+                    std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &path))
+                {
+                    crate::log::warn(&format!("Could not save pipeline cache file: {e}"));
+                }
             }
         }
         log(&format!("  Created {} pipelines", self.pipelines.len()));

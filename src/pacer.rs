@@ -79,7 +79,7 @@ impl Pacer {
         let interval = sample.interval;
         if !interval.is_finite()
             || interval <= 0.0
-            || interval > self.refresh * self.cap as f64 * 4.0
+            || interval > f64::max(0.2, self.refresh * self.cap as f64 * 4.0)
         {
             return self.lock(1);
         }
@@ -218,6 +218,13 @@ mod tests {
 
     fn total(p: &mut Pacer, s: Sample, frames: usize) -> usize {
         (0..frames).map(|_| check(p, s).len()).sum()
+    }
+
+    #[test]
+    fn slow_game_on_fast_display_is_not_a_hitch() {
+        // 15 fps at 144 Hz: 67 ms is under the 200 ms floor, so it locks to two slots
+        let mut p = Pacer::new(1.0 / 144.0, 2);
+        assert!(total(&mut p, trusted(1.0 / 15.0), 60) > 60);
     }
 
     #[test]

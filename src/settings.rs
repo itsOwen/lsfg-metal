@@ -153,7 +153,11 @@ pub fn apply_env(cfg: &mut Config, env: Env) -> Result<(), String> {
         cfg.allow_half_precision = v != "1";
     }
     if let Some(v) = nonempty(env, "LSFGM_LOG_LEVEL") {
-        cfg.log_level = LogLevel::parse(&v)?;
+        // the only override that can fail; losing generation over a typo here is the wrong trade
+        match LogLevel::parse(&v) {
+            Ok(l) => cfg.log_level = l,
+            Err(e) => crate::log::warn(&format!("{e}; keeping {}", cfg.log_level.name())),
+        }
     }
     if let Some(v) = nonempty(env, "LSFGM_LOG_FILE") {
         cfg.log_file = Some(v);
@@ -747,10 +751,9 @@ mod tests {
             err(&[("LSFGM_PACING_MODE", "Bogus")]),
             "Unrecognized pacing mode: bogus"
         );
-        assert_eq!(
-            err(&[("LSFGM_LOG_LEVEL", "Loud")]),
-            "Unrecognized log level: loud"
-        );
+        // a bad log level is a warning, not a reason to disable generation
+        let cfg = load_with(&env(&[("LSFGM_ENV", "1"), ("LSFGM_LOG_LEVEL", "Loud")])).unwrap();
+        assert_eq!(cfg.log_level.name(), "info");
     }
 
     #[test]

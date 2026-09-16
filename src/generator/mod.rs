@@ -291,6 +291,10 @@ impl Context {
         } else {
             self.settle("previous")?;
             self.iteration += 1;
+            // a partial signaled iteration left the caller's pre-signal for the next acquire unconsumed
+            if self.index > 0 && self.index < self.total {
+                self.sync_value += 1;
+            }
         }
         self.pipeline.set_iteration(self.iteration);
         self.sync_value += 1;

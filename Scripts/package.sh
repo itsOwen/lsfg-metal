@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")/.."
 out=dist/renderers/lsfg
 version="${LSFGM_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.1.0)}"
-rm -rf dist
+rm -rf "$out"
 mkdir -p "$out"
 cp target/x86_64-apple-darwin/release/liblsfg_metal.dylib "$out/libMoltenVK.dylib"
 ln -s ../../frameworks/libMoltenVK.dylib "$out/libMoltenVK.real.dylib"
