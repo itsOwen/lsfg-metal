@@ -289,6 +289,7 @@ impl Fixed {
             inner_info.as_ref().map_or(std::ptr::null(), |n| std::ptr::from_ref(n).cast());
         for i in 0..inserted as usize {
             let inner = *self.inner.get(i).ok_or("Inner pass missing")?;
+            ctx.generate((i + 1) as f32 / m as f32)?;
             let (idx, _) = hook
                 .swapchain
                 .acquire_next_image(swapchain, 1_000_000_000, inner.acquire, vk::Fence::null())

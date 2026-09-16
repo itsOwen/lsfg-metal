@@ -185,6 +185,15 @@ impl Wrapper {
         Ok(())
     }
 
+    // submit the main pass now so the gpu works while the caller waits for a swapchain image
+    pub fn generate(&mut self, timestamp: f32) -> Result<(), String> {
+        if !self.generated && self.remaining > 0 {
+            self.ctx.acquire(false, timestamp)?;
+            self.generated = true;
+        }
+        Ok(())
+    }
+
     // main pass first (single in-order queue), then the copy out that waits on it
     pub fn acquire(
         &mut self,
