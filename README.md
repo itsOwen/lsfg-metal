@@ -84,7 +84,9 @@ driver and the `nextDrawable` hook returns the original drawable. It is a transp
 
 * x86_64 Wine running under Rosetta. The shim, your Wine build's MoltenVK and the game are all x86_64.
 * A MoltenVK that exposes `VK_EXT_metal_objects`. The Metal front end and the proxy swapchain
-  import Metal textures and shared events through it.
+  import Metal textures and shared events through it. MoltenVK 1.4.2 or newer is recommended:
+  [1.4.2 fixes imported-texture residency and device loss with argument buffers](https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/Docs/Whats_New.md).
+  That driver release requires macOS 12 or newer.
 * macOS 11 or newer (the deployment target of this crate).
 * Your own `lsfg-vk.dll` from the *Lossless Scaling* Steam application, which you can buy at
   <https://store.steampowered.com/app/993090/>. Select the **`lsfg-vk` beta branch** under
