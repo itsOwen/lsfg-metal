@@ -2,6 +2,7 @@
 mod drawable;
 mod generator;
 mod hooks;
+mod latency;
 mod proxy;
 
 use std::path::PathBuf;

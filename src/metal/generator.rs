@@ -22,6 +22,7 @@ use objc2_metal::{
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use super::drawable::ProxyDrawable;
+use super::latency;
 use super::{enabled, hooks, set_enabled, setup, vk_format, Setup};
 use crate::generator::{Context, Instance};
 use crate::log;
@@ -36,6 +37,7 @@ type Drawable = Retained<ProtocolObject<dyn CAMetalDrawable>>;
 const GPU_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct Job {
+    pub latency: latency::Frame,
     pub cb: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     pub drawable: Retained<ProxyDrawable>,
     pub duration: f64,
@@ -56,6 +58,7 @@ struct Pool {
 }
 
 pub struct Generator {
+    latency: latency::Probe,
     pub layer: Retained<CAMetalLayer>,
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     present_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -87,6 +90,7 @@ impl Generator {
         let device = layer.device().or_else(|| MTLCreateSystemDefaultDevice())?;
         let (tx, rx) = channel();
         let g = Box::leak(Box::new(Generator {
+            latency: latency::Probe::default(),
             layer: layer.retain(),
             present_queue: device.newCommandQueue()?,
             game_event: device.newSharedEvent()?,
@@ -197,7 +201,8 @@ impl Generator {
         self.send(Msg::Forget(textures));
     }
 
-    pub fn enqueue(&'static self, job: Job) {
+    pub fn enqueue(&'static self, mut job: Job) {
+        job.latency.enqueue();
         self.send(Msg::Job(job));
     }
 
@@ -213,7 +218,8 @@ impl Generator {
             }
         });
         // the worker is gone: no more generation, show this frame ourselves
-        if let Err(SendError(Msg::Job(job))) = self.tx.send(msg) {
+        if let Err(SendError(Msg::Job(mut job))) = self.tx.send(msg) {
+            job.latency.start();
             log::error("Metal presentation worker is gone, presenting natively from now on");
             set_enabled(false);
             present_natively(self, &job);
@@ -809,6 +815,7 @@ impl Worker {
     }
 
     fn process(&mut self, job: &mut Job) {
+        job.latency.start();
         if job.sample.interval.is_finite() && job.sample.interval > 0.0 {
             self.stats.seconds += job.sample.interval;
             self.stats.samples += 1;
@@ -1077,7 +1084,9 @@ impl Worker {
         }
         for (i, &slot) in slots.iter().take(inserted).enumerate() {
             self.ctx.as_mut().unwrap().generate(slot)?;
+            let acquire_start = job.latency.clock();
             let target = self.next_real("no drawable for a generated frame")?;
+            let acquire_ms = (job.latency.clock() - acquire_start) * 1000.0;
             let ttex = target.texture();
             let timg = self.imported(&ttex)?;
             let ready = self.next_serial();
@@ -1098,16 +1107,30 @@ impl Worker {
             if !show_original && i == inserted - 1 {
                 forward_presented(job.drawable.clone(), &target);
             }
+            self.gen.latency.attach(
+                &target,
+                job.latency,
+                acquire_ms,
+                latency::Kind::Generated,
+            );
             self.present_when_ready(&target, duration, ready)?;
             self.stats.generated += 1;
         }
         if show_original {
+            let acquire_start = job.latency.clock();
             let target = self.next_real("no drawable for the original frame")?;
+            let acquire_ms = (job.latency.clock() - acquire_start) * 1000.0;
             let timg = self.imported(&target.texture())?;
             let ready = self.next_serial();
             self.copy(self.cmd[1 + inserted], source, timg, (present, ready), fence)?;
             self.frame_pending = true;
             forward_presented(job.drawable.clone(), &target);
+            self.gen.latency.attach(
+                &target,
+                job.latency,
+                acquire_ms,
+                latency::Kind::Original,
+            );
             self.present_when_ready(&target, duration, ready)?;
             self.retire(job.drawable.clone(), ready);
             self.stats.original += 1;
@@ -1231,7 +1254,7 @@ impl Worker {
 }
 
 // false when the frame had to be dropped (its presented handlers still fire)
-fn present_natively(gen: &Generator, job: &Job) -> bool {
+fn present_natively(gen: &'static Generator, job: &Job) -> bool {
     if job.serial == 0 {
         if let Some(cb) = &job.cb {
             if !wait_completed(cb) {
@@ -1239,7 +1262,9 @@ fn present_natively(gen: &Generator, job: &Job) -> bool {
             }
         }
     }
+    let acquire_start = job.latency.clock();
     let real = hooks::original_next_drawable(&gen.layer);
+    let acquire_ms = (job.latency.clock() - acquire_start) * 1000.0;
     let cb = gen.present_queue.commandBuffer();
     let (Some(real), Some(cb)) = (real, cb) else {
         // a game waiting on its presented handler must not block forever
@@ -1260,6 +1285,8 @@ fn present_natively(gen: &Generator, job: &Job) -> bool {
             blit.endEncoding();
         }
     }
+    gen.latency
+        .attach(&real, job.latency, acquire_ms, latency::Kind::Fallback);
     forward_presented(job.drawable.clone(), &real);
     let keep = job.drawable.clone();
     let block = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {

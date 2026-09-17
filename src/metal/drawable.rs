@@ -146,6 +146,7 @@ impl ProxyDrawable {
         };
         let cb = hooks::last_committed();
         gen.enqueue(Job {
+            latency: Default::default(),
             cb,
             drawable: self.retain(),
             duration,

@@ -337,6 +337,7 @@ impl ProxySwapchain {
                 state.1.notify_all();
             });
             self.gen.enqueue(Job {
+                latency: Default::default(),
                 cb: None,
                 drawable,
                 duration: 0.0,

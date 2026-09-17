@@ -141,14 +141,16 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_VULKAN_PROXY` | proxy swapchain for adaptive pacing on the Vulkan path | `0` disables it and forces the fixed present path | unset, proxy used when supported |
 | `LSFGM_TARGET_FPS` | override the display refresh used by the pacer | finite positive float, whole string | unset, the main screen's rate |
 | `LSFGM_STATS` | periodic statistics lines | read by **presence** | unset |
+| `LSFGM_LATENCY` | Metal presentation latency, p50/p95 every 120 callbacks per frame kind | read by **presence** | unset |
 | `LSFGM_PACE_DEBUG` | per-frame estimator log line | read by **presence** | unset |
 | `LSFGM_METAL_DUMP` | frame dump directory (Metal path) | directory path | unset |
 | `LSFGM_CONFIG` | configuration file path, used verbatim and highest precedence | path; must exist or loading fails | unset |
 | `LSFGM_PROFILE` | select a profile by exact name | profile name | unset |
 | `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.1.0` |
 
-Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_STATS` and
-`LSFGM_PACE_DEBUG`. Every other variable is read by value and is only honoured when non-empty.
+Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_STATS`,
+`LSFGM_PACE_DEBUG` and `LSFGM_LATENCY`. Every other variable is read by value and is only
+honoured when non-empty.
 
 The boolean variables do not share one truth rule: the profile flags are true only for `1`,
 `LSFGM_NO_FP16` disables fp16 only for `1`, and `LSFGM_METAL` and `LSFGM_VULKAN_PROXY` are on for
@@ -359,6 +361,19 @@ pace interval=<ms>ms blocked=<ms>ms
 with ` (untrusted)` appended when the sample was not trusted. This is how to see why the pacer
 picked the slot counts it did.
 
+**`LSFGM_LATENCY`.** On the Metal front end and Vulkan proxy, the real drawable's
+`presentedTime` measures display timing in the host clock domain. Every 120 callbacks
+per kind (`generated`, `original`, or `fallback`), a `Metal latency` line reports
+p50/p95 milliseconds for `enqueue_display`, `queue`, `worker`, `drawable`, and
+`submit_display`. Queue time begins when the source enters the presentation worker's
+queue; worker time ends when the real present is submitted and includes drawable
+waiting. The drawable field measures that frame's acquisition only. Generated frames
+share their source's enqueue time; later slots include earlier slots' work and pacing.
+Zero or invalid presentation times are counted as dropped and excluded from percentiles.
+These measurements exclude input sampling and rendering before enqueue, so they are
+presentation latency rather than input-to-photon latency. They do not cover the Vulkan
+fixed path. Leave the variable unset to avoid timestamp and callback overhead.
+
 **`LSFGM_METAL_DUMP=<dir>`.** On the Metal path, source frame 89 is written as `<dir>/previous`,
 source frame 90 as `<dir>/original`, and each generated frame of frame 90 as `<dir>/generated<i>`.
 Format is PPM (`P6 <w> <h> 255\n` then RGB bytes, B and R swapped for BGRA formats, alpha dropped),
@@ -421,14 +436,15 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 27 tests, no GPU and no display needed: `cargo test --release`. Set
+**Unit tests.** 28 tests, no GPU and no display needed: `cargo test --release`. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, cap
 behaviour, untrusted runs and probing, invalid intervals, the hitch floor on a fast display, a
 closed-loop convergence model), the settings library (environment mode, config path
 precedence, TOML round trip and `~` expansion, error messages, profile identification order, reload
 on mtime change), the PE resource walk, the feature-chain copy, memory type selection, the memory
-planner, the pipeline signature tables, the recursive mutex and half-float conversion.
+planner, the pipeline signature tables, the recursive mutex, half-float conversion and the
+latency probe's percentiles.
 
 **`validate`.** Runs the generator on a real driver with synthetic input and reports timings and the
 centre pixel of the last generated frame.

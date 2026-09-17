@@ -341,6 +341,7 @@ unsafe extern "C-unwind" fn commit_hook(this: *mut AnyObject, sel: Sel) {
             };
             orig(this, sel);
             gen.enqueue(Job {
+                latency: Default::default(),
                 cb: Some(cb.retain()),
                 drawable,
                 duration,
