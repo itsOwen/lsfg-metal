@@ -36,6 +36,8 @@ const SMOOTHING: f64 = 0.2;
 const SNAP: f64 = 0.1;
 const CAP_AFTER: u32 = 10;
 const PROBE_AFTER: u32 = 60;
+// frames a probe lasts; the first carries the game's catch-up after the held frames and is dropped
+const PROBE_SAMPLES: usize = 4;
 // tolerance on slot <= ratio so accumulated phase rounding cannot produce a near-zero slot
 const EPS: f64 = 1e-9;
 
@@ -47,6 +49,7 @@ pub struct Pacer {
     cadence: f64,
     untrusted: u32,
     probing: u32,
+    probes: Vec<f64>,
     phase: f64,
     histogram: [u32; 9],
 }
@@ -65,6 +68,7 @@ impl Pacer {
             cadence: 0.0,
             untrusted: 0,
             probing: 0,
+            probes: Vec::new(),
             phase: 1.0,
             histogram: [0; 9],
         }
@@ -84,15 +88,23 @@ impl Pacer {
             return self.lock(1);
         }
         if sample.trusted {
-            let probed = self.probing > 0;
             self.untrusted = 0;
-            self.probing = 0;
             self.cadence = 0.0;
-            self.estimate = if self.estimate == 0.0 || probed {
-                interval
+            if self.probing > 0 {
+                self.probes.push(interval);
+                if self.probes.len() < PROBE_SAMPLES {
+                    return self.lock(1);
+                }
+                let rest = &mut self.probes[1..];
+                rest.sort_by(f64::total_cmp);
+                self.estimate = rest[rest.len() / 2];
+                self.probes.clear();
+                self.probing = 0;
+            } else if self.estimate == 0.0 {
+                self.estimate = interval;
             } else {
-                self.estimate * (1.0 - SMOOTHING) + interval * SMOOTHING
-            };
+                self.estimate = self.estimate * (1.0 - SMOOTHING) + interval * SMOOTHING;
+            }
         } else {
             self.cadence = if self.cadence == 0.0 {
                 interval
@@ -104,7 +116,7 @@ impl Pacer {
             {
                 self.estimate = self.cadence;
             }
-            if self.untrusted >= PROBE_AFTER {
+            if self.untrusted >= PROBE_AFTER || self.probing > 0 {
                 self.probing += 1;
                 return self.lock(1);
             }
@@ -311,11 +323,21 @@ mod tests {
         assert_eq!(total(&mut p, trusted(1.0 / 30.0), 60), 120);
         assert_eq!(total(&mut p, untrusted(1.0 / 30.0), 59), 118);
         assert_eq!(check(&mut p, untrusted(1.0 / 30.0)), [1.0]);
+        assert_eq!(total(&mut p, trusted(1.0 / 30.0), 3), 3);
         assert_eq!(check(&mut p, trusted(1.0 / 30.0)), [0.5, 1.0]);
-        // after another 60 untrusted a trusted 1.2x sample replaces the estimate unsmoothed
+        // after another 60 untrusted, the probe's median replaces the estimate unsmoothed
         assert_eq!(total(&mut p, untrusted(1.0 / 30.0), 60), 118 + 1);
+        assert_eq!(total(&mut p, trusted(1.2 / 60.0), 3), 3);
         assert_eq!(check(&mut p, trusted(1.2 / 60.0)).len(), 1);
         assert_eq!(p.interval(), 1.2 / 60.0);
+        // a capped game catching up after held frames, then a hitch: measured in slay the spire
+        total(&mut p, untrusted(1.0 / 30.0), 59);
+        assert_eq!(check(&mut p, untrusted(1.0 / 30.0)), [1.0]);
+        for ms in [10.3, 29.8, 32.2] {
+            assert_eq!(check(&mut p, trusted(ms / 1000.0)), [1.0]);
+        }
+        assert_eq!(check(&mut p, trusted(0.169)).len(), 2);
+        assert_eq!(p.interval(), 0.0322);
         // a slower untrusted cadence caps the estimate after 10 frames
         let mut p = Pacer::new(REFRESH, 4);
         assert_eq!(total(&mut p, trusted(1.0 / 20.0), 20), 60);
