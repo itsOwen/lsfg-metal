@@ -493,7 +493,6 @@ struct Wrapper {
     source: vk::Image,
     dest: vk::Image,
     sync: vk::Semaphore,
-    fence: vk::Fence,
     extent: (u32, u32),
     iteration: u32,
     remaining: u32,
@@ -512,13 +511,11 @@ impl Wrapper {
     ) -> Result<Wrapper, String> {
         let ctx = Context::new(b.inst.clone(), w, h, flow, perf, hdr)?;
         let (source, dest, sync) = ctx.handles();
-        let fence = vkutil::create_fence(&b.device)?;
         Ok(Wrapper {
             ctx,
             source,
             dest,
             sync,
-            fence,
             extent: (w, h),
             iteration: 0,
             remaining: 0,
@@ -539,11 +536,7 @@ impl Wrapper {
         signal: (vk::Semaphore, u64),
     ) -> Result<(), String> {
         let d = &b.device;
-        if self.iteration != 0 {
-            unsafe { d.wait_for_fences(&[self.fence], true, GPU_TIMEOUT.as_nanos() as u64) }
-                .map_err(|_| "Frame-generation copy did not complete")?;
-            check(unsafe { d.reset_fences(&[self.fence]) }, "vkResetFences")?;
-        }
+        // the worker waits for the previous frame's final copy before reusing this context
         let layer = self.iteration % 2;
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as P};
         vkutil::begin(d, cb, vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)?;
@@ -598,12 +591,12 @@ impl Wrapper {
             );
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
-        let fence = if inserted == 0 {
-            self.fence
-        } else {
-            vk::Fence::null()
-        };
-        b.submit(&[cb], &[wait], &[(self.sync, self.sync_counter + 1), signal], fence)?;
+        b.submit(
+            &[cb],
+            &[wait],
+            &[(self.sync, self.sync_counter + 1), signal],
+            vk::Fence::null(),
+        )?;
         self.in_flight = true;
         self.ctx.dispatch(inserted, false)?;
         self.remaining = inserted;
@@ -629,6 +622,7 @@ impl Wrapper {
         target: vk::Image,
         ts: f64,
         signal: (vk::Semaphore, u64),
+        fence: vk::Fence,
     ) -> Result<(), String> {
         let d = &b.device;
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as P};
@@ -694,11 +688,6 @@ impl Wrapper {
             self.ctx.acquire(false, ts as f32)?;
         }
         self.generated = false;
-        let fence = if self.remaining == 1 {
-            self.fence
-        } else {
-            vk::Fence::null()
-        };
         b.submit(&[cb], &waits, &signals, fence)?;
         self.remaining -= 1;
         self.sync_counter += 1;
@@ -718,7 +707,6 @@ impl Wrapper {
     fn destroy(mut self, b: &Backend) {
         self.idle(b);
         let _ = self.ctx.idle();
-        unsafe { b.device.destroy_fence(self.fence, None) };
     }
 }
 
@@ -989,6 +977,7 @@ impl Worker {
         src: vk::Image,
         dst: vk::Image,
         signal: (vk::Semaphore, u64),
+        fence: vk::Fence,
     ) -> Result<(), String> {
         let b = self.backend.as_ref().unwrap();
         let d = &b.device;
@@ -1019,7 +1008,7 @@ impl Worker {
             vkutil::cmd_blit(d, cb, src, 0, dst, 0, self.extent);
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
-        b.submit(&[cb], &[], &[signal], vk::Fence::null())
+        b.submit(&[cb], &[], &[signal], fence)
     }
 
     fn next_real(&self, what: &str) -> Result<Drawable, Fail> {
@@ -1093,10 +1082,16 @@ impl Worker {
             let timg = self.imported(&ttex)?;
             let ready = self.next_serial();
             let (b, cb) = (self.backend.as_ref().unwrap(), self.cmd[1 + i]);
+            let completion = if !show_original && i + 1 == inserted {
+                fence
+            } else {
+                vk::Fence::null()
+            };
             self.ctx
                 .as_mut()
                 .unwrap()
-                .acquire(b, cb, timg, slot, (present, ready))?;
+                .acquire(b, cb, timg, slot, (present, ready), completion)?;
+            self.frame_pending |= completion != vk::Fence::null();
             if self.stats.source == 90 {
                 self.dump(&ttex, &format!("generated{i}"), ready);
             }
@@ -1110,7 +1105,8 @@ impl Worker {
             let target = self.next_real("no drawable for the original frame")?;
             let timg = self.imported(&target.texture())?;
             let ready = self.next_serial();
-            self.copy(self.cmd[1 + inserted], source, timg, (present, ready))?;
+            self.copy(self.cmd[1 + inserted], source, timg, (present, ready), fence)?;
+            self.frame_pending = true;
             forward_presented(job.drawable.clone(), &target);
             self.present_when_ready(&target, duration, ready)?;
             self.retire(job.drawable.clone(), ready);
@@ -1118,11 +1114,6 @@ impl Worker {
         } else {
             self.retire(job.drawable.clone(), copied);
         }
-        self.backend
-            .as_ref()
-            .unwrap()
-            .submit(&[], &[], &[], fence)?;
-        self.frame_pending = true;
         log::log_fmt(
             log::Level::Debug,
             format_args!(
