@@ -1644,9 +1644,13 @@ unsafe extern "system" fn destroy_surface(
 extern "C" fn constructor() {
     panic_to_log();
     // the vulkan path initialises lazily inside the exports; the metal front end is armed at load
-    if settings::os_env("LSFGM_METAL").is_some_and(|v| !v.is_empty() && v != "0") {
+    let on = |k| settings::os_env(k).is_some_and(|v| !v.is_empty() && v != "0");
+    if on("LSFGM_METAL") {
         let _ = layer();
         crate::metal::install();
+    } else if on("LSFGM_OPENGL") {
+        let _ = layer();
+        crate::metal::install_opengl();
     }
 }
 

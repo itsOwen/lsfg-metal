@@ -20,15 +20,17 @@ like with it. If you build something good on top of this, I would genuinely like
 
 ## Status
 
-Two hooks cover the renderers a Wine bottle can use:
+Three hooks cover the renderers a Wine bottle can use:
 
 | Renderer | Hook |
 |---|---|
 | DXVK | Vulkan hook (the shim stands in for `libMoltenVK.dylib`) |
 | vkd3d-proton | Vulkan hook |
 | WineD3D on its Vulkan renderer | Vulkan hook |
+| WineD3D on its OpenGL renderer (D3D9 tested) | OpenGL hook |
 | DXMT | Metal hook (`CAMetalLayer` presentation) |
 | D3DMetal | Metal hook |
+| OpenGL games | OpenGL hook (`-[NSOpenGLContext flushBuffer]`) |
 
 * Multipliers 2 to 4. Multiplier 1 is accepted in a config file and disables generation; above 4 is
   rejected by the settings library.
@@ -67,7 +69,15 @@ owned by the shim, and swizzles the driver's command buffer class for `presentDr
 frame to a per-layer worker thread, which runs the pipeline on a private Vulkan device and presents
 the layer's real drawables.
 
-With no matching profile, both hooks stay out of the way: the shim forwards every call to the real
+The OpenGL front end rides on the same injection. It is armed with `LSFGM_METAL=1` alongside the
+Metal hooks, or alone with `LSFGM_OPENGL=1`, which leaves `CAMetalLayer` untouched for processes
+whose layers belong to a Vulkan driver. It swizzles `-[NSOpenGLContext flushBuffer]`, blits the
+back buffer into an `IOSurface` shared with the private Vulkan device, and blits each generated
+frame back into the back buffer before calling the original swap. The game's framebuffer bindings,
+read buffer, scissor and sRGB state are restored before it continues. Adaptive pacing works here
+too; the time spent in generated swaps is fed back to the estimator.
+
+With no matching profile, all hooks stay out of the way: the shim forwards every call to the real
 driver and the `nextDrawable` hook returns the original drawable. It is a transparent passthrough.
 
 ## Requirements
@@ -107,13 +117,20 @@ export DYLD_LIBRARY_PATH="$HOME/lsfg:$DYLD_LIBRARY_PATH"
 export DYLD_INSERT_LIBRARIES="$HOME/lsfg/libMoltenVK.dylib"
 export LSFGM_METAL=1
 
+# OpenGL games, alongside the Vulkan path (the Metal path already includes it)
+export DYLD_INSERT_LIBRARIES="$HOME/lsfg/libMoltenVK.dylib"
+export LSFGM_OPENGL=1
+
 # configuration
 export LSFGM_ENV=1 LSFGM_MULTIPLIER=2
 export LSFGM_DLL_PATH="/path/to/Lossless Scaling/lsfg-vk.dll"
 ```
 
-WineD3D's OpenGL renderer presents through a path neither hook covers. Switch it to Vulkan with
-`WINE_D3D_CONFIG=renderer=vulkan` when generation is on.
+The OpenGL hook also generates frames for WineD3D's OpenGL renderer. Heaven 4.0 in Direct3D 9
+mode rendered with `WINE_D3D_CONFIG=renderer=gl`, while WineD3D's Vulkan renderer failed with
+generation both on and off. In the tested Sikarugir Wine 10.0 engine on macOS, WineD3D's OpenGL
+renderer failed to create a Direct3D 11 device. Choose the WineD3D renderer for the game;
+enabling generation does not require switching it to Vulkan.
 
 Instead of the symlink you can point `LSFGM_MOLTENVK` at the real driver, under any name other
 than `libMoltenVK.dylib`.
@@ -137,7 +154,8 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_LOG_LEVEL` | log level | `debug`, `info`, `warning`, `error` | `info` |
 | `LSFGM_LOG_FILE` | append logs to this file as well as stderr | path | unset |
 | `LSFGM_MOLTENVK` | real driver path | path to the real MoltenVK, any leaf name but `libMoltenVK.dylib` | `libMoltenVK.real.dylib` beside the shim |
-| `LSFGM_METAL` | enable the Metal front end | enabled when set, non-empty and not `0` | unset |
+| `LSFGM_METAL` | enable the Metal front end, OpenGL included | enabled when set, non-empty and not `0` | unset |
+| `LSFGM_OPENGL` | enable only the OpenGL front end; ignored when `LSFGM_METAL` is on | enabled when set, non-empty and not `0` | unset |
 | `LSFGM_VULKAN_PROXY` | proxy swapchain for adaptive pacing on the Vulkan path | `0` disables it and forces the fixed present path | unset, proxy used when supported |
 | `LSFGM_TARGET_FPS` | override the display refresh used by the pacer | finite positive float, whole string | unset, the main screen's rate |
 | `LSFGM_STATS` | periodic statistics lines | read by **presence** | unset |
@@ -153,8 +171,9 @@ Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_STATS`
 honoured when non-empty.
 
 The boolean variables do not share one truth rule: the profile flags are true only for `1`,
-`LSFGM_NO_FP16` disables fp16 only for `1`, and `LSFGM_METAL` and `LSFGM_VULKAN_PROXY` are on for
-anything but `0`. `LSFGM_PERFORMANCE_MODE=true` therefore means false.
+`LSFGM_NO_FP16` disables fp16 only for `1`, and `LSFGM_METAL`, `LSFGM_OPENGL` and
+`LSFGM_VULKAN_PROXY` are on for anything but `0`. `LSFGM_PERFORMANCE_MODE=true` therefore means
+false.
 
 In file mode only `LSFGM_DLL_PATH`, `LSFGM_NO_FP16`, `LSFGM_LOG_LEVEL` and `LSFGM_LOG_FILE` are read;
 they override the file's `[global]` values, also after a reload. The profile variables
@@ -436,15 +455,15 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 28 tests, no GPU and no display needed: `cargo test --release`. Set
+**Unit tests.** 29 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, cap
 behaviour, untrusted runs and probing, invalid intervals, the hitch floor on a fast display, a
 closed-loop convergence model), the settings library (environment mode, config path
 precedence, TOML round trip and `~` expansion, error messages, profile identification order, reload
 on mtime change), the PE resource walk, the feature-chain copy, memory type selection, the memory
-planner, the pipeline signature tables, the recursive mutex, half-float conversion and the
-latency probe's percentiles.
+planner, the pipeline signature tables, the recursive mutex, half-float conversion, the
+latency probe's percentiles and the OpenGL state restore.
 
 **`validate`.** Runs the generator on a real driver with synthetic input and reports timings and the
 centre pixel of the last generated frame.

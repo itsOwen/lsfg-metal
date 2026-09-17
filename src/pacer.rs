@@ -184,7 +184,7 @@ pub fn display_refresh() -> f64 {
     })
 }
 
-// appkit is not linked by this crate; the class is only there when the host process loaded it
+// resolved at runtime; the class is only there once appkit is loaded
 fn main_screen_fps() -> isize {
     use objc2::runtime::{AnyClass, AnyObject};
     let Some(cls) = AnyClass::get(c"NSScreen") else {

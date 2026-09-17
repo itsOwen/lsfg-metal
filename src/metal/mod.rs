@@ -1,6 +1,7 @@
 // metal presenter and proxy swapchain
 mod drawable;
 mod generator;
+mod gl;
 mod hooks;
 mod latency;
 mod proxy;
@@ -14,7 +15,18 @@ use objc2_metal::MTLPixelFormat;
 
 use crate::settings::Profile;
 
-pub use hooks::{forget_surface, install, register_layer};
+pub use hooks::{forget_surface, register_layer};
+
+// metal layer swizzles plus the opengl buffer swap
+pub fn install() {
+    hooks::install();
+    gl::install();
+}
+
+// only the opengl buffer swap, for processes whose metal layers belong to a vulkan driver
+pub fn install_opengl() {
+    gl::install();
+}
 pub use proxy::{
     invalidate_proxies, proxy_supported, set_proxy_supported, GameDevice, ProxySwapchain, QueueLock,
 };

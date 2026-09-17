@@ -28,10 +28,11 @@ ash = { version = "0.38", default-features = false, features = ["std", "debug"] 
 libloading = "0.8"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString"] }
-objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLTexture", "MTLCommandBuffer", "MTLCommandQueue", "MTLEvent", "MTLDrawable", "MTLResource", "MTLPixelFormat", "MTLBuffer", "MTLBlitCommandEncoder", "MTLCommandEncoder", "MTLTypes", "block2"] }
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLTexture", "MTLCommandBuffer", "MTLCommandQueue", "MTLEvent", "MTLDrawable", "MTLResource", "MTLPixelFormat", "MTLBuffer", "MTLBlitCommandEncoder", "MTLCommandEncoder", "MTLTypes", "block2", "objc2-io-surface"] }
 objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "CALayer", "objc2-metal", "objc2-core-graphics"] }
 objc2-core-graphics = { version = "0.3", features = ["CGColorSpace"] }
-objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes", "CFDictionary", "CFNumber", "CFString"] }
+objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2-core-foundation"] }
 block2 = "0.6"
 
 [profile.release]

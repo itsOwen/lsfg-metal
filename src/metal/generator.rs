@@ -34,7 +34,7 @@ type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
 type Drawable = Retained<ProtocolObject<dyn CAMetalDrawable>>;
 
 // bound on every cpu wait for the gpu; a hung frame falls back to native presents instead of a hang
-const GPU_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const GPU_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct Job {
     pub latency: latency::Frame,
@@ -330,11 +330,11 @@ pub(crate) fn image_info(
 
 // ---- backend ----
 
-struct Backend {
+pub(super) struct Backend {
     _instance: ash::Instance,
-    device: ash::Device,
+    pub(super) device: ash::Device,
     queue: vk::Queue,
-    pool: vk::CommandPool,
+    pub(super) pool: vk::CommandPool,
     inst: Arc<Instance>,
     _lib: libloading::Library,
 }
@@ -374,7 +374,7 @@ fn driver_path() -> Option<PathBuf> {
 }
 
 impl Backend {
-    fn create(setup: &Setup) -> Result<Backend, String> {
+    pub(super) fn create(setup: &Setup) -> Result<Backend, String> {
         let path = driver_path().ok_or("real MoltenVK is not loaded")?;
         let (lib, entry) = vkutil::load_driver(&path)?;
         let instance = vkutil::create_instance(&entry, c"lsfg-metal", vk::API_VERSION_1_2, false)?;
@@ -494,7 +494,7 @@ impl Backend {
 
 // ---- context wrapper on the backend queue ----
 
-struct Wrapper {
+pub(super) struct Wrapper {
     ctx: Context,
     source: vk::Image,
     dest: vk::Image,
@@ -508,7 +508,7 @@ struct Wrapper {
 }
 
 impl Wrapper {
-    fn new(
+    pub(super) fn new(
         b: &Backend,
         (w, h): (u32, u32),
         flow: f32,
@@ -532,7 +532,7 @@ impl Wrapper {
     }
 
     // copy the game's frame into the alternating source layer and start the iteration
-    fn dispatch(
+    pub(super) fn dispatch(
         &mut self,
         b: &Backend,
         cb: vk::CommandBuffer,
@@ -621,7 +621,7 @@ impl Wrapper {
     }
 
     // copy one generated frame out of the context into the target image
-    fn acquire(
+    pub(super) fn acquire(
         &mut self,
         b: &Backend,
         cb: vk::CommandBuffer,
@@ -703,14 +703,14 @@ impl Wrapper {
         Ok(())
     }
 
-    fn idle(&mut self, b: &Backend) {
+    pub(super) fn idle(&mut self, b: &Backend) {
         if self.in_flight {
             self.in_flight = false;
             let _ = unsafe { b.device.queue_wait_idle(b.queue) };
         }
     }
 
-    fn destroy(mut self, b: &Backend) {
+    pub(super) fn destroy(mut self, b: &Backend) {
         self.idle(b);
         let _ = self.ctx.idle();
     }
