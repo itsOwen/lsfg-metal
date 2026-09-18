@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLTexture;
+use objc2_core_graphics::{kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceSRGB, CGColorSpace};
+use objc2_metal::{MTLPixelFormat, MTLTexture};
 use objc2_quartz_core::CAMetalLayer;
 
 use super::drawable::ProxyDrawable;
@@ -104,6 +105,13 @@ impl ProxySwapchain {
         let Some(format) = super::mtl_format(info.image_format) else {
             return Ok(None);
         };
+        // the generator treats float as scrgb and everything else as srgb; other pairs keep the driver swapchain
+        let scrgb = info.image_color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT;
+        if scrgb != (format == MTLPixelFormat::RGBA16Float)
+            || !(scrgb || info.image_color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+        {
+            return Ok(None);
+        }
         let setup = super::setup().ok_or("no active frame-generation profile")?;
         hooks::install();
         hooks::install_cb_hooks(&layer);
@@ -121,6 +129,16 @@ impl ProxySwapchain {
             layer.setDevice(Some(&gen.device));
         }
         layer.setPixelFormat(format);
+        // no driver swapchain sets the colour space either; scrgb values above 1.0 also need edr
+        let space = unsafe {
+            CGColorSpace::with_name(Some(if scrgb {
+                kCGColorSpaceExtendedLinearSRGB
+            } else {
+                kCGColorSpaceSRGB
+            }))
+        };
+        layer.setColorspace(space.as_deref());
+        layer.setWantsExtendedDynamicRangeContent(scrgb);
         layer.setFramebufferOnly(false);
         layer.setDrawableSize(objc2_core_foundation::CGSize::new(extent.0 as f64, extent.1 as f64));
         let mut textures = Vec::with_capacity(count);

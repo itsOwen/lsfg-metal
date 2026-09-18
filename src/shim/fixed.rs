@@ -136,7 +136,7 @@ impl Fixed {
             return Err(e.into());
         }
         if profile.pacing_mode == PacingMode::Adaptive {
-            log::info(&format!("Adaptive pacing needs the proxy swapchain (VK_EXT_metal_objects); using the fixed multiplier {m}"));
+            log::info(&format!("Adaptive pacing is not available for this swapchain (the proxy needs VK_EXT_metal_objects and an sRGB or scRGB format); using the fixed multiplier {m}"));
         }
         Ok(f)
     }

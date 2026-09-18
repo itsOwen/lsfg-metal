@@ -98,6 +98,7 @@ pub(crate) fn mtl_format(f: vk::Format) -> Option<MTLPixelFormat> {
         vk::Format::R8G8B8A8_UNORM => MTLPixelFormat::RGBA8Unorm,
         vk::Format::R8G8B8A8_SRGB => MTLPixelFormat::RGBA8Unorm_sRGB,
         vk::Format::R16G16B16A16_SFLOAT => MTLPixelFormat::RGBA16Float,
+        vk::Format::A2B10G10R10_UNORM_PACK32 => MTLPixelFormat::RGB10A2Unorm,
         _ => return None,
     })
 }
