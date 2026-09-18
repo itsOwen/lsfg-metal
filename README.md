@@ -9,7 +9,8 @@ through Steam. It has also only ever run on one Apple Silicon Mac, a handful of 
 60 Hz display. Everything outside that is untested, so expect rough edges on hardware, games and
 refresh rates it has never seen. A bug report with a log attached is worth more than a star.
 
-There is plenty left to do: wider game coverage, high-refresh and multi-display pacing, and HDR10.
+There is plenty left to do: wider game coverage, high-refresh and multi-display pacing, and HDR10 on
+a real HDR display.
 One ceiling is the platform's, not a bug: MoltenVK caps a swapchain at 3 images and CoreAnimation
 returns one drawable per refresh, so with vsync released a 60 Hz panel tops out at 60·m/(m−1)
 presented fps (120 at 2x, 80 at 4x); a 120 Hz panel doubles that.
@@ -37,9 +38,15 @@ Three hooks cover the renderers a Wine bottle can use:
 * Pacing: fixed (`vsync`, evenly spaced timestamps `1/m .. m/m`) and adaptive (the pacer fits
   generated frames to display slots).
 * Performance mode (the performance shader set) and flow scale 0.25 to 1.0.
-* HDR is linear `RGBA16F` only: Vulkan `R16G16B16A16_SFLOAT` with
-  `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`, and `CAMetalLayer`s in `RGBA16Float` with
-  `kCGColorSpaceExtendedLinearSRGB`. Plus single-layer RGBA8/BGRA8 sRGB swapchains.
+* SDR formats: single-layer 8-bit RGBA8/BGRA8 (unorm or sRGB), 10-bit `A2B10G10R10` /
+  `A2R10G10B10` (what Unreal Engine games present) and, on the Vulkan path, `R16G16B16A16_SFLOAT`
+  in sRGB. On the Metal path: BGRA8/RGBA8 and `RGB10A2Unorm` layers.
+* HDR: linear scRGB, Vulkan `R16G16B16A16_SFLOAT` with `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
+  and `CAMetalLayer`s in `RGBA16Float` with `kCGColorSpaceExtendedLinearSRGB`. On the Vulkan path
+  also HDR10: 10-bit with `VK_COLOR_SPACE_HDR10_ST2084_EXT`.
+* Generated frames of 10-bit and float sources pass through 8-bit images, so they can band slightly
+  in smooth gradients; the game's own frames are untouched. Any other format keeps native
+  presentation and the log names its format and colour space.
 
 Everything else keeps native presentation.
 
@@ -397,7 +404,8 @@ fixed path. Leave the variable unset to avoid timestamp and callback overhead.
 
 **`LSFGM_METAL_DUMP=<dir>`.** On the Metal path, source frame 89 is written as `<dir>/previous`,
 source frame 90 as `<dir>/original`, and each generated frame of frame 90 as `<dir>/generated<i>`.
-Format is PPM (`P6 <w> <h> 255\n` then RGB bytes, B and R swapped for BGRA formats, alpha dropped),
+Format is PPM (`P6 <w> <h> 255\n` then RGB bytes, B and R swapped for BGRA formats, `RGB10A2Unorm`
+reduced to 8 bits per channel, alpha dropped),
 or PFM for `RGBA16Float` (`PF\n<w> <h>\n-1.0\n` then bottom-to-top RGB float32 rows). With the
 `mtlclear` smoke test, whose white square moves 8 px per frame, the generated frames must show the
 square at intermediate positions. That is the check that the output is interpolation and not a copy.
@@ -495,8 +503,12 @@ Any mismatch prints `<shader> binding <n> has the wrong image view type (resourc
 
 **`vkclear`.** `cargo run --release --example vkclear -- <libMoltenVK.dylib> [frames]`, frames
 defaults to 240. It loads the driver by the path given, clears a swapchain image with one of two
-colours on alternate frames and presents FIFO. `VKTEST_FPS` paces the source like a capped game. Point it at
-the shim and set `LSFGM_MOLTENVK` to the real driver:
+colours on alternate frames and presents FIFO. `VKTEST_FPS` paces the source like a capped game.
+`VKTEST_FORMAT` and `VKTEST_COLORSPACE` take raw Vulkan enum values for the swapchain format and
+colour space, `VKTEST_LIST` prints the surface formats the driver offers, `VKTEST_LAYER` prints the
+layer's format, colour space and EDR state at the end, and `VKTEST_RELEASE` acquires and releases
+images without presenting (`VK_EXT_swapchain_maintenance1`). Point it at the shim and set
+`LSFGM_MOLTENVK` to the real driver:
 
 ```sh
 LSFGM_MOLTENVK=/path/to/real/libMoltenVK.dylib \
@@ -512,7 +524,9 @@ rate settles near `60/m`, because the generated frames fill the gaps.
 drawable and blits a 32x32 white square that moves 8 px per frame, which is what makes interpolation
 visible. `MTLTEST_FPS` paces the source rate; `MTLTEST_MINDURATION=<fps>` presents with
 `afterMinimumDuration: 1/fps` (a value of 1 or less means 1/60); `MTLTEST_WIDTH` and
-`MTLTEST_HEIGHT` size the window, 640x480 by default. It needs the shim injected:
+`MTLTEST_HEIGHT` size the window, 640x480 by default. `MTLTEST_FORMAT` takes a raw
+`MTLPixelFormat` value for the layer (the square is only drawn for BGRA8), and `MTLTEST_DOUBLE`
+presents a second layer on the same command buffer. It needs the shim injected:
 
 ```sh
 DYLD_INSERT_LIBRARIES=dist/renderers/lsfg/libMoltenVK.dylib LSFGM_METAL=1 \
@@ -533,8 +547,8 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
 
 ## Limitations
 
-* HDR10 and PQ are not supported. HDR means linear `RGBA16F` in extended linear sRGB and nothing
-  else; a PQ or HDR10 swapchain or layer keeps native presentation.
+* HDR10 has not been tested on an HDR display. Adaptive pacing falls back to fixed pacing for HDR10
+  and for float sRGB swapchains, because its proxy only presents sRGB and scRGB.
 * Multi-GPU Intel Macs are not handled. The Metal front end's private backend takes the first
   enumerated Vulkan device, which is the layer's device on every Apple Silicon Mac but is not
   guaranteed to be on a two-GPU Intel Mac.
