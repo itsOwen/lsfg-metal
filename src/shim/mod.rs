@@ -1620,7 +1620,7 @@ unsafe extern "system" fn release_swapchain_images(
     device: vk::Device,
     info: *const vk::ReleaseSwapchainImagesInfoEXT,
 ) -> vk::Result {
-    if proxy::is_proxy((*info).swapchain) {
+    if proxy::release(&*info) {
         return vk::Result::SUCCESS;
     }
     device_call(

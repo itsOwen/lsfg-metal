@@ -304,6 +304,20 @@ impl ProxySwapchain {
         vk::Result::SUCCESS
     }
 
+    // vkReleaseSwapchainImagesEXT: acquired images the game will not present go back to the pool
+    pub fn release_images(&self, indices: &[u32]) {
+        let (m, cv) = &*self.state;
+        let mut s = m.lock().unwrap();
+        for &i in indices {
+            if let Some(st) = s.status.get_mut(i as usize) {
+                if *st == Status::Acquired {
+                    *st = Status::Free;
+                }
+            }
+        }
+        cv.notify_all();
+    }
+
     // hand the presented image to the metal worker; a present we cannot honour invalidates the proxy instead
     pub fn queue_present(&self, queue: vk::Queue, info: &vk::PresentInfoKHR) -> vk::Result {
         locked(&self.lock, || {

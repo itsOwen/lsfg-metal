@@ -92,6 +92,18 @@ pub unsafe fn create(
     Ok(Some((handle, b)))
 }
 
+// released images return to the proxy's pool; false when the swapchain is not a proxy
+pub unsafe fn release(info: &vk::ReleaseSwapchainImagesInfoEXT) -> bool {
+    let Some(e) = swapchain_of(info.swapchain).filter(|e| e.proxy) else {
+        return false;
+    };
+    let indices = std::slice::from_raw_parts(info.p_image_indices, info.image_index_count as usize);
+    if let Some(p) = e.wrapper.as_ref().expect("proxy").read().unwrap().as_proxy() {
+        p.release_images(indices);
+    }
+    true
+}
+
 pub fn is_proxy(sc: vk::SwapchainKHR) -> bool {
     swapchain_of(sc).is_some_and(|e| e.proxy)
 }
