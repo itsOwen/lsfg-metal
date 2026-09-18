@@ -375,6 +375,9 @@ fn driver_path() -> Option<PathBuf> {
 
 impl Backend {
     pub(super) fn create(setup: &Setup) -> Result<Backend, String> {
+        // each layer's worker builds its own backend; moltenvk instance creation must not race
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = CREATE.lock().unwrap_or_else(|e| e.into_inner());
         let path = driver_path().ok_or("real MoltenVK is not loaded")?;
         let (lib, entry) = vkutil::load_driver(&path)?;
         let instance = vkutil::create_instance(&entry, c"lsfg-metal", vk::API_VERSION_1_2, false)?;
