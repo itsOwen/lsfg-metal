@@ -175,6 +175,10 @@ impl Generator {
             let (p, r) = self.pool_cv.wait_timeout(pool, Duration::from_secs(1)).unwrap();
             pool = p;
             if r.timed_out() && pool.outstanding >= 3 {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn("Metal drawable pool exhausted (the game holds three drawables); this frame and any like it present natively");
+                }
                 return None;
             }
         }
@@ -1240,9 +1244,14 @@ impl Worker {
                 format,
                 MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB
             );
+            let packed = format == MTLPixelFormat::RGB10A2Unorm;
             out.extend_from_slice(format!("P6 {w} {h} 255\n").as_bytes());
             for p in px.chunks_exact(4) {
-                out.extend_from_slice(&if bgra {
+                // rgb10a2 is one little-endian word, red in the low ten bits
+                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                out.extend_from_slice(&if packed {
+                    [(v >> 2) as u8, (v >> 12) as u8, (v >> 22) as u8]
+                } else if bgra {
                     [p[2], p[1], p[0]]
                 } else {
                     [p[0], p[1], p[2]]
