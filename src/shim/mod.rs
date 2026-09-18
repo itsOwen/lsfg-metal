@@ -650,7 +650,7 @@ unsafe fn resolve_device(
 unsafe fn create_surface(
     instance: vk::Instance,
     name: &CStr,
-    layer_ptr: *const c_void,
+    layer_of: impl Fn() -> *const c_void,
     surface: *mut vk::SurfaceKHR,
     call: impl FnOnce(unsafe extern "system" fn()) -> vk::Result,
 ) -> vk::Result {
@@ -658,12 +658,15 @@ unsafe fn create_surface(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     active(drv);
-    proxy::register_layer(layer_ptr);
+    proxy::register_layer(layer_of());
     let Some(real) = (drv.gipa)(instance, name.as_ptr()) else {
         return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
     };
     let r = call(real);
     if r == vk::Result::SUCCESS {
+        // the driver may have created the view's layer during the call
+        let layer_ptr = layer_of();
+        proxy::register_layer(layer_ptr);
         proxy::register_surface(*surface, layer_ptr);
     }
     r
@@ -686,7 +689,7 @@ pub unsafe extern "system" fn vkCreateMetalSurfaceEXT(
     create_surface(
         instance,
         c"vkCreateMetalSurfaceEXT",
-        layer_ptr,
+        || layer_ptr,
         surface,
         |f| {
             std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateMetalSurfaceEXT>(f)(
@@ -728,15 +731,17 @@ pub unsafe extern "system" fn vkCreateMacOSSurfaceMVK(
     alloc: *const vk::AllocationCallbacks,
     surface: *mut vk::SurfaceKHR,
 ) -> vk::Result {
-    let layer_ptr = if info.is_null() {
-        std::ptr::null()
-    } else {
-        view_layer((*info).p_view)
+    let layer_of = || {
+        if info.is_null() {
+            std::ptr::null()
+        } else {
+            view_layer((*info).p_view)
+        }
     };
     create_surface(
         instance,
         c"vkCreateMacOSSurfaceMVK",
-        layer_ptr,
+        layer_of,
         surface,
         |f| {
             std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateMacOSSurfaceMVK>(f)(
