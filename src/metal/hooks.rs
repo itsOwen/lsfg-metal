@@ -47,7 +47,7 @@ static PENDING_KEY: u8 = 0;
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "LSFGMPendingPresent"]
-    #[ivars = (Retained<ProxyDrawable>, f64)]
+    #[ivars = RefCell<Vec<(Retained<ProxyDrawable>, f64)>>]
     struct PendingPresent;
 
     unsafe impl NSObjectProtocol for PendingPresent {}
@@ -288,10 +288,17 @@ fn ours(drawable: *mut AnyObject) -> Option<Retained<ProxyDrawable>> {
     }
 }
 
+// a command buffer can carry several presents; each one is kept in order
 fn attach(cb: *mut AnyObject, drawable: Retained<ProxyDrawable>, duration: f64) {
-    let p: Retained<PendingPresent> = unsafe {
-        msg_send![super(PendingPresent::alloc().set_ivars((drawable, duration))), init]
-    };
+    let key = &PENDING_KEY as *const u8 as *const c_void;
+    let existing = unsafe { ffi::objc_getAssociatedObject(cb, key) as *const PendingPresent };
+    if let Some(p) = unsafe { existing.as_ref() } {
+        p.ivars().borrow_mut().push((drawable, duration));
+        return;
+    }
+    let list = RefCell::new(vec![(drawable, duration)]);
+    let p: Retained<PendingPresent> =
+        unsafe { msg_send![super(PendingPresent::alloc().set_ivars(list)), init] };
     unsafe {
         ffi::objc_setAssociatedObject(
             cb,
@@ -302,14 +309,16 @@ fn attach(cb: *mut AnyObject, drawable: Retained<ProxyDrawable>, duration: f64) 
     };
 }
 
-// take the pending present off the command buffer, if any
-fn detach(cb: *mut AnyObject) -> Option<(Retained<ProxyDrawable>, f64)> {
+// take the pending presents off the command buffer
+fn detach(cb: *mut AnyObject) -> Vec<(Retained<ProxyDrawable>, f64)> {
     let key = &PENDING_KEY as *const u8 as *const c_void;
     unsafe {
         let p = ffi::objc_getAssociatedObject(cb, key) as *const PendingPresent;
-        let p = Retained::retain(p as *mut PendingPresent)?;
+        let Some(p) = Retained::retain(p as *mut PendingPresent) else {
+            return Vec::new();
+        };
         ffi::objc_setAssociatedObject(cb, key, std::ptr::null_mut(), ffi::OBJC_ASSOCIATION_RETAIN);
-        Some(p.ivars().clone())
+        p.ivars().take()
     }
 }
 
@@ -349,8 +358,10 @@ unsafe extern "C-unwind" fn present_at_hook(
 unsafe extern "C-unwind" fn commit_hook(this: *mut AnyObject, sel: Sel) {
     let orig = CB_HOOKS.get().unwrap().commit;
     let cb = &*(this as *const ProtocolObject<dyn MTLCommandBuffer>);
-    match detach(this).and_then(|(d, dur)| d.owner().map(|g| (d, dur, g))) {
-        Some((drawable, duration, gen)) => {
+    let pending: Vec<_> = detach(this)
+        .into_iter()
+        .filter_map(|(d, dur)| d.owner().map(|g| (d, dur, g)))
+        .map(|(drawable, duration, gen)| {
             let serial = if enabled() {
                 let serial = gen.next_serial();
                 cb.encodeSignalEvent_value(
@@ -361,17 +372,19 @@ unsafe extern "C-unwind" fn commit_hook(this: *mut AnyObject, sel: Sel) {
             } else {
                 0
             };
-            orig(this, sel);
-            gen.enqueue(Job {
-                latency: Default::default(),
-                cb: Some(cb.retain()),
-                drawable,
-                duration,
-                serial,
-                sample: gen.frame_sample(),
-            });
-        }
-        None => orig(this, sel),
+            (drawable, duration, gen, serial)
+        })
+        .collect();
+    orig(this, sel);
+    for (drawable, duration, gen, serial) in pending {
+        gen.enqueue(Job {
+            latency: Default::default(),
+            cb: Some(cb.retain()),
+            drawable,
+            duration,
+            serial,
+            sample: gen.frame_sample(),
+        });
     }
     if !IS_WORKER.with(|w| w.get()) {
         let _ = LAST_COMMITTED.try_with(|c| *c.borrow_mut() = Some(cb.retain()));
