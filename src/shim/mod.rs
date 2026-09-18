@@ -1139,11 +1139,22 @@ unsafe fn supported(
     ci: &vk::SwapchainCreateInfoKHR,
 ) -> Option<vk::SurfaceCapabilitiesKHR> {
     use vk::Format as F;
-    let sdr = ci.image_color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-        && matches!(
-            ci.image_format,
-            F::B8G8R8A8_UNORM | F::R8G8B8A8_UNORM | F::B8G8R8A8_SRGB | F::R8G8B8A8_SRGB
-        );
+    let ten_bit = matches!(
+        ci.image_format,
+        F::A2B10G10R10_UNORM_PACK32 | F::A2R10G10B10_UNORM_PACK32
+    );
+    // hdr10 is 10-bit pq, generated through the same path as sdr
+    let sdr = (ci.image_color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        && (ten_bit
+            || matches!(
+                ci.image_format,
+                F::B8G8R8A8_UNORM
+                    | F::R8G8B8A8_UNORM
+                    | F::B8G8R8A8_SRGB
+                    | F::R8G8B8A8_SRGB
+                    | F::R16G16B16A16_SFLOAT
+            )))
+        || (ten_bit && ci.image_color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT);
     let hdr = ci.image_format == F::R16G16B16A16_SFLOAT
         && ci.image_color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT;
     if !((sdr || hdr)
@@ -1151,7 +1162,8 @@ unsafe fn supported(
         && !ci.flags.contains(vk::SwapchainCreateFlagsKHR::PROTECTED))
     {
         warn!(
-            "Frame generation disabled for this swapchain (format, colour space, array layers or protected flag); preserving native presentation"
+            "Frame generation disabled for this swapchain ({:?}, {:?}, {} array layers, flags {:?}); preserving native presentation",
+            ci.image_format, ci.image_color_space, ci.image_array_layers, ci.flags
         );
         return None;
     }
