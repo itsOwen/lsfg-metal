@@ -1,6 +1,7 @@
 // mtlclear smoke test: clears a CAMetalLayer drawable and blits a 32x32 white square moving 8 px per frame
 // MTLTEST_FPS paces the source rate, MTLTEST_MINDURATION=<fps> presents with afterMinimumDuration, argv[1] = frame count
 // MTLTEST_WIDTH and MTLTEST_HEIGHT size the window, default 640x480
+// MTLTEST_FORMAT=<raw MTLPixelFormat> sets the layer format; MTLTEST_DOUBLE presents a second layer on the same command buffer
 // run with the shim on DYLD_INSERT_LIBRARIES and LSFGM_METAL=1; the example must not link the crate itself
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -60,12 +61,26 @@ fn main() {
     let device = MTLCreateSystemDefaultDevice().expect("metal device");
     let layer = CAMetalLayer::new();
     layer.setDevice(Some(&device));
-    layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    let format = std::env::var("MTLTEST_FORMAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(MTLPixelFormat::BGRA8Unorm, MTLPixelFormat);
+    layer.setPixelFormat(format);
     layer.setDrawableSize(CGSize::new(w, h));
     layer.setFramebufferOnly(false);
     let view = window.contentView().expect("content view");
     view.setWantsLayer(true);
     view.setLayer(Some(&layer));
+    let second = std::env::var_os("MTLTEST_DOUBLE").map(|_| {
+        let l = CAMetalLayer::new();
+        l.setDevice(Some(&device));
+        l.setPixelFormat(format);
+        l.setDrawableSize(CGSize::new(w / 2.0, h / 2.0));
+        l.setFramebufferOnly(false);
+        l.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w / 2.0, h / 2.0)));
+        layer.addSublayer(&l);
+        Retained::into_raw(l) as usize
+    });
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
@@ -75,7 +90,8 @@ fn main() {
     let layer_ptr = Retained::into_raw(layer) as usize;
     std::thread::spawn(move || {
         let layer = unsafe { Retained::from_raw(layer_ptr as *mut CAMetalLayer) }.unwrap();
-        render(&layer, &device, frames, fps, min_duration);
+        let second = second.map(|p| unsafe { Retained::from_raw(p as *mut CAMetalLayer) }.unwrap());
+        render(&layer, second.as_deref(), &device, frames, fps, min_duration);
         std::process::exit(0);
     });
     app.run();
@@ -83,6 +99,7 @@ fn main() {
 
 fn render(
     layer: &CAMetalLayer,
+    second: Option<&CAMetalLayer>,
     device: &ProtocolObject<dyn MTLDevice>,
     frames: usize,
     fps: Option<f64>,
@@ -131,6 +148,17 @@ fn render(
             };
             let target = drawable.texture();
             let cb = queue.commandBuffer().expect("command buffer");
+            // the second layer is presented first, so a lost first present shows on it
+            if let Some(extra) = second.and_then(|l| l.nextDrawable()) {
+                let pass = MTLRenderPassDescriptor::new();
+                let att = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+                att.setTexture(Some(&extra.texture()));
+                att.setLoadAction(MTLLoadAction::Clear);
+                att.setStoreAction(MTLStoreAction::Store);
+                att.setClearColor(MTLClearColor { red: 0.8, green: 0.2, blue: 0.2, alpha: 1.0 });
+                cb.renderCommandEncoderWithDescriptor(&pass).expect("encoder").endEncoding();
+                cb.presentDrawable(ProtocolObject::from_ref(&*extra));
+            }
             let pass = MTLRenderPassDescriptor::new();
             let att = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
             att.setTexture(Some(&target));
@@ -148,6 +176,13 @@ fn render(
                 .endEncoding();
             let x = (i * 8) % (w - 32);
             let y = (i * 8 / (w - 32) * 40) % (h - 32);
+            if target.pixelFormat() != MTLPixelFormat::BGRA8Unorm {
+                let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
+                cb.presentDrawable(d);
+                cb.commit();
+                shown += 1;
+                return;
+            }
             let blit = cb.blitCommandEncoder().expect("blit");
             unsafe {
                 blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(

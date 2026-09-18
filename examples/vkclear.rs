@@ -104,6 +104,7 @@ fn run(driver: &str, frames: u32) -> Result<(), String> {
         let iexts = [
             khr::surface::NAME.as_ptr(),
             ext::metal_surface::NAME.as_ptr(),
+            ext::swapchain_colorspace::NAME.as_ptr(),
         ];
         let instance = check(
             entry.create_instance(
@@ -138,13 +139,19 @@ fn run(driver: &str, frames: u32) -> Result<(), String> {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&prio)];
-        let dexts = [khr::swapchain::NAME.as_ptr()];
+        let release_test = std::env::var_os("VKTEST_RELEASE").is_some();
+        let mut dexts = vec![khr::swapchain::NAME.as_ptr()];
+        if release_test {
+            dexts.push(ext::swapchain_maintenance1::NAME.as_ptr());
+        }
+        let mut m1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default().swapchain_maintenance1(true);
         // a chained vulkan 1.2 structure exercises the shim's feature-chain copy like dxvk does
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&dexts)
             .push_next(&mut f12);
+        let dci = if release_test { dci.push_next(&mut m1) } else { dci };
         let device = check(instance.create_device(pd, &dci, None), "vkCreateDevice")?;
         assert_eq!(
             (f12.timeline_semaphore, f12.shader_float16),
@@ -165,11 +172,20 @@ fn run(driver: &str, frames: u32) -> Result<(), String> {
         } else {
             caps.current_extent
         };
+        // VKTEST_FORMAT / VKTEST_COLORSPACE pick the swapchain format and colour space by raw value
+        let raw = |k| std::env::var(k).ok().and_then(|v| v.parse::<i32>().ok());
+        let format = raw("VKTEST_FORMAT").map_or(vk::Format::B8G8R8A8_UNORM, vk::Format::from_raw);
+        let space = raw("VKTEST_COLORSPACE").map_or(vk::ColorSpaceKHR::SRGB_NONLINEAR, vk::ColorSpaceKHR::from_raw);
+        if std::env::var_os("VKTEST_LIST").is_some() {
+            for f in check(surface_fn.get_physical_device_surface_formats(pd, surface), "vkGetPhysicalDeviceSurfaceFormatsKHR")? {
+                println!("vkclear: surface format {:?} {:?}", f.format, f.color_space);
+            }
+        }
         let sc_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(caps.min_image_count.max(2))
-            .image_format(vk::Format::B8G8R8A8_UNORM)
-            .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            .image_format(format)
+            .image_color_space(space)
             .image_extent(extent)
             .image_array_layers(1)
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
@@ -200,6 +216,24 @@ fn run(driver: &str, frames: u32) -> Result<(), String> {
             create_semaphore(&device)?,
             check(device.create_fence(&vk::FenceCreateInfo::default(), None), "vkCreateFence")?,
         );
+        // VKTEST_RELEASE acquires and releases without presenting; every acquire must succeed
+        if release_test {
+            let m1_fn = ext::swapchain_maintenance1::Device::new(&instance, &device);
+            let fence = check(device.create_fence(&vk::FenceCreateInfo::default(), None), "vkCreateFence")?;
+            for n in 0..5 {
+                let r = swap_fn.acquire_next_image(swapchain, 2_000_000_000, vk::Semaphore::null(), fence);
+                println!("vkclear: release test acquire {n}: {r:?}");
+                let Ok((idx, _)) = r else { break };
+                check(device.wait_for_fences(&[fence], true, u64::MAX), "vkWaitForFences")?;
+                check(device.reset_fences(&[fence]), "vkResetFences")?;
+                let indices = [idx];
+                check(
+                    m1_fn.release_swapchain_images(&vk::ReleaseSwapchainImagesInfoEXT::default().swapchain(swapchain).image_indices(&indices)),
+                    "vkReleaseSwapchainImagesEXT",
+                )?;
+            }
+            device.destroy_fence(fence, None);
+        }
         let mut presented = 0;
         let start = std::time::Instant::now();
         for i in 0..frames {
@@ -309,6 +343,11 @@ fn run(driver: &str, frames: u32) -> Result<(), String> {
         surface_fn.destroy_surface(surface, None);
         instance.destroy_instance(None);
         println!("vkclear: presented {presented} frames");
+        if std::env::var_os("VKTEST_LAYER").is_some() {
+            let l = &*layer;
+            let space = objc2_core_graphics::CGColorSpace::name(l.colorspace().as_deref()).map(|n| n.to_string());
+            println!("vkclear: layer format {} colorspace {space:?} edr {}", l.pixelFormat().0, l.wantsExtendedDynamicRangeContent());
+        }
     }
     Ok(())
 }
