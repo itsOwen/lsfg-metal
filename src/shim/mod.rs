@@ -263,6 +263,13 @@ impl Layer {
     fn new() -> Result<Option<Layer>, String> {
         let config = settings::load()?;
         let Some((profile, method)) = settings::identify(&config) else {
+            // a misspelt LSFGM_PROFILE is the one miss worth reporting; unrelated processes stay quiet
+            if let Some(name) = settings::os_env("LSFGM_PROFILE").filter(|n| !n.is_empty()) {
+                if let Some(f) = &config.log_file {
+                    log::set_file(f);
+                }
+                warn!("LSFGM_PROFILE '{name}' matches no profile in the config file; frame generation stays off");
+            }
             return Ok(None);
         };
         log::set_level(level(config.log_level));
@@ -327,6 +334,7 @@ impl Layer {
         info!("Config file changed on disk, reloading...");
         let name = &s.config.profiles[s.profile].name;
         let Some(i) = cfg.profiles.iter().position(|p| &p.name == name) else {
+            warn!("Profile '{name}' is no longer in the config file; keeping its previous settings");
             return Ok(false);
         };
         s.profile = i;
@@ -1336,6 +1344,16 @@ unsafe extern "system" fn queue_present(
         return vk::Result::ERROR_OUT_OF_DATE_KHR;
     }
     let Some(w) = &entry.wrapper else {
+        // a wrapped swapchain later in the array is presented natively too; say so once
+        if pi.swapchain_count > 1 {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            let handles = std::slice::from_raw_parts(pi.p_swapchains, pi.swapchain_count as usize);
+            if handles[1..].iter().any(|&s| swapchain_of(s).is_some_and(|e| e.wrapper.is_some()))
+                && !WARNED.swap(true, Ordering::Relaxed)
+            {
+                warn!("Frame generation skipped: multi-swapchain present");
+            }
+        }
         return (entry.present)(queue, info);
     };
     let r = w.write().unwrap().present(queue, pi, entry.present);
