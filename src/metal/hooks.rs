@@ -203,13 +203,35 @@ pub fn forget_surface(surface: vk::SurfaceKHR) {
     }
 }
 
-// supported layer formats; RGBA16F only with an extended linear srgb colour space
+// supported layer formats (8-bit, 10-bit, and RGBA16F only with an extended linear srgb colour space)
 pub(crate) fn layer_supported(layer: &CAMetalLayer) -> bool {
+    let ok = format_supported(layer);
+    if !ok {
+        // warn once per format and colour space, nextDrawable runs every frame
+        static SEEN: Mutex<Vec<(usize, Option<String>)>> = Mutex::new(Vec::new());
+        let key = (
+            layer.pixelFormat().0,
+            CGColorSpace::name(layer.colorspace().as_deref()).map(|n| n.to_string()),
+        );
+        let mut seen = SEEN.lock().unwrap();
+        if !seen.contains(&key) {
+            log::warn(&format!(
+                "Frame generation disabled for this Metal layer (pixel format {}, colour space {:?}); presenting natively",
+                key.0, key.1
+            ));
+            seen.push(key);
+        }
+    }
+    ok
+}
+
+fn format_supported(layer: &CAMetalLayer) -> bool {
     match layer.pixelFormat() {
         MTLPixelFormat::BGRA8Unorm
         | MTLPixelFormat::BGRA8Unorm_sRGB
         | MTLPixelFormat::RGBA8Unorm
-        | MTLPixelFormat::RGBA8Unorm_sRGB => true,
+        | MTLPixelFormat::RGBA8Unorm_sRGB
+        | MTLPixelFormat::RGB10A2Unorm => true,
         MTLPixelFormat::RGBA16Float => {
             let name = CGColorSpace::name(layer.colorspace().as_deref()).map(|n| n.to_string());
             name.as_deref() == Some(&unsafe { kCGColorSpaceExtendedLinearSRGB }.to_string())
