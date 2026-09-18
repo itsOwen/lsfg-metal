@@ -520,9 +520,11 @@ impl Pipeline {
                 unsafe { d.get_pipeline_cache_data(self.cache) },
                 "vkGetPipelineCacheData",
             )?;
-            // rewrite when the driver's data changed; per-process temp name so two contexts do not interleave
+            // rewrite when the driver's data changed; per-process and per-save temp name so two contexts do not interleave
             if bytes != data {
-                let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+                static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp = path.with_extension(format!("tmp{}.{n}", std::process::id()));
                 if let Err(e) =
                     std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &path))
                 {
