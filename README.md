@@ -1,7 +1,7 @@
 # lsfg-metal (BETA)
 
-Lossless Scaling frame generation for Wine games on macOS: a MoltenVK shim plus a Metal front end,
-independent Rust implementation, MIT.
+Lossless Scaling frame generation for Wine games and native Metal games on macOS: a MoltenVK shim
+plus a Metal front end, independent Rust implementation, MIT.
 
 **This is a very early release.** It does what it claims: 2x, 3x and 4x hold their exact cadence
 with no dropped or duplicated frames, on the Vulkan path and the Metal path, verified in real games
@@ -32,6 +32,7 @@ Three hooks cover the renderers a Wine bottle can use:
 | DXMT | Metal hook (`CAMetalLayer` presentation) |
 | D3DMetal | Metal hook |
 | OpenGL games | OpenGL hook (`-[NSOpenGLContext flushBuffer]`) |
+| Native macOS games on Metal (arm64 build) | Metal hook |
 
 * Multipliers 2 to 4. Multiplier 1 is accepted in a config file and disables generation; above 4 is
   rejected by the settings library.
@@ -90,6 +91,8 @@ driver and the `nextDrawable` hook returns the original drawable. It is a transp
 ## Requirements
 
 * x86_64 Wine running under Rosetta. The shim, your Wine build's MoltenVK and the game are all x86_64.
+  Native Apple Silicon games use an arm64 build of the shim instead; see
+  [Native macOS games](#native-macos-games).
 * A MoltenVK that exposes `VK_EXT_metal_objects`. The Metal front end and the proxy swapchain
   import Metal textures and shared events through it. MoltenVK 1.4.2 or newer is recommended:
   [1.4.2 fixes imported-texture residency and device loss with argument buffers](https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/Docs/Whats_New.md).
@@ -176,6 +179,30 @@ WineD3D and an OpenGL game.
 Use `LSFGM_GENERATOR_MOLTENVK`, not `LSFGM_MOLTENVK`, for the newer driver: CrossOver's DXVK and
 WineD3D only start on CrossOver's own MoltenVK, and `LSFGM_MOLTENVK` would change the driver the
 game uses as well.
+
+### Native macOS games
+
+A native Apple Silicon game that draws with Metal can use the Metal front end directly, from an
+arm64 build of the shim: download `lsfg-v<version>-arm64.tar.xz` from the
+[releases](https://github.com/itsOwen/lsfg-metal/releases), or build it with
+`cargo build --release --target aarch64-apple-darwin`. Tested with the native Valheim (Unity) at
+2x: about 28 source fps shown at about 56, with a frame dump confirming the generated frames.
+
+```sh
+cd "/path/to/steamapps/common/Valheim"
+DYLD_INSERT_LIBRARIES=/path/to/lsfg-metal/liblsfg_metal.dylib \
+LSFGM_METAL=1 LSFGM_ENV=1 LSFGM_MULTIPLIER=2 \
+LSFGM_DLL_PATH="/path/to/Lossless Scaling/lsfg-vk.dll" \
+LSFGM_GENERATOR_MOLTENVK=/path/to/MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib \
+./valheim.app/Contents/MacOS/Valheim
+```
+
+`LSFGM_GENERATOR_MOLTENVK` needs an arm64 MoltenVK 1.3 or newer; the official `MoltenVK-macos.tar`
+is universal. A Steam game also needs the Steam client running. The game's code signature must
+allow injected libraries: `codesign -d --entitlements - <game>.app` has to list
+`com.apple.security.cs.allow-dyld-environment-variables` and
+`com.apple.security.cs.disable-library-validation`, or the app must not use the hardened runtime.
+Valheim's signature allows it; many games do not, and those cannot use frame generation this way.
 
 ## Configuration, environment mode
 
@@ -584,6 +611,8 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
 
 ## Limitations
 
+* Native macOS games are tested on one title (Valheim) and work only when their code signature
+  allows injected libraries.
 * HDR10 has not been tested on an HDR display. The proxy swapchain only presents sRGB and scRGB, so
   HDR10 and float sRGB swapchains use the fixed present path: fixed pacing, generated on the game's
   device, which needs the game's MoltenVK to be 1.3 or newer.
