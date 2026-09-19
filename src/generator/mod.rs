@@ -40,13 +40,14 @@ impl Instance {
     ) -> Result<Instance, String> {
         let (lib, entry) = vkutil::load_driver(driver)?;
         let instance = vkutil::create_instance(&entry, c"lsfg-metal", vk::API_VERSION_1_2, true)?;
-        let (pd, device, family, fp16) = match Self::own_device(&instance, device_id, allow_fp16) {
-            Ok(x) => x,
-            Err(e) => {
-                unsafe { instance.destroy_instance(None) };
-                return Err(e);
-            }
-        };
+        let (pd, device, family, fp16) =
+            match Self::own_device(&entry, &instance, device_id, allow_fp16) {
+                Ok(x) => x,
+                Err(e) => {
+                    unsafe { instance.destroy_instance(None) };
+                    return Err(e);
+                }
+            };
         let shaders = match shaders::Library::load(&device, fp16, dll, log) {
             Ok(s) => s,
             Err(e) => {
@@ -72,11 +73,14 @@ impl Instance {
     }
 
     fn own_device(
+        entry: &ash::Entry,
         instance: &ash::Instance,
         device_id: &str,
         allow_fp16: bool,
     ) -> Result<(vk::PhysicalDevice, ash::Device, u32, bool), String> {
         let pd = vkutil::select_physical_device(instance, device_id)?;
+        let gipa = entry.static_fn().get_instance_proc_addr;
+        vkutil::check_driver(gipa, instance.handle(), pd)?;
         let family = vkutil::find_queue_family(instance, pd, vk::QueueFlags::COMPUTE, false)?;
         let fp16 = allow_fp16 && vkutil::half_precision_supported(instance, pd);
         let mut s2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
@@ -120,6 +124,7 @@ impl Instance {
                 instance,
             )
         };
+        vkutil::check_driver(gipa, instance.handle(), physical_device)?;
         let device = unsafe { ash::Device::load(instance.fp_v1_0(), device) };
         // ash loads only the khr name and installs a panicking stub when it is missing, so fail early instead
         let barrier2 = unsafe {

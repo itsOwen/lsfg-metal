@@ -118,6 +118,35 @@ pub fn half_precision_supported(instance: &ash::Instance, pd: vk::PhysicalDevice
     f12.shader_float16 == vk::TRUE
 }
 
+// moltenvk before 1.3 runs the generation shaders but writes black frames
+pub fn check_driver(
+    gipa: vk::PFN_vkGetInstanceProcAddr,
+    instance: vk::Instance,
+    pd: vk::PhysicalDevice,
+) -> Result<(), String> {
+    // the khr name serves vulkan 1.0 instances; with neither there is no driver id to check
+    let Some(f) = [c"vkGetPhysicalDeviceProperties2", c"vkGetPhysicalDeviceProperties2KHR"]
+        .iter()
+        .find_map(|n| unsafe { gipa(instance, n.as_ptr()) })
+    else {
+        return Ok(());
+    };
+    let f: vk::PFN_vkGetPhysicalDeviceProperties2 = unsafe { std::mem::transmute(f) };
+    let mut driver = vk::PhysicalDeviceDriverProperties::default();
+    let mut p = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+    unsafe { f(pd, &mut p) };
+    let v = p.properties.driver_version;
+    if driver.driver_id == vk::DriverId::MOLTENVK && v < 10300 {
+        return Err(format!(
+            "MoltenVK {}.{}.{} is too old for frame generation (it outputs black frames); MoltenVK 1.3 or newer is needed",
+            v / 10000,
+            v / 100 % 100,
+            v % 100
+        ));
+    }
+    Ok(())
+}
+
 // first eligible device-local type, else the last eligible type
 pub fn memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,

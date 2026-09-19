@@ -94,6 +94,9 @@ driver and the `nextDrawable` hook returns the original drawable. It is a transp
   import Metal textures and shared events through it. MoltenVK 1.4.2 or newer is recommended:
   [1.4.2 fixes imported-texture residency and device loss with argument buffers](https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/Docs/Whats_New.md).
   That driver release requires macOS 12 or newer.
+* MoltenVK 1.3 or newer for frame generation itself. MoltenVK 1.2.x compiles the shaders but writes
+  black generated frames, so the shim refuses it, logs `MoltenVK <version> is too old for frame
+  generation`, and the game presents natively.
 * macOS 11 or newer (the deployment target of this crate).
 * Your own `lsfg-vk.dll` from the *Lossless Scaling* Steam application, which you can buy at
   <https://store.steampowered.com/app/993090/>. Select the **`lsfg-vk` beta branch** under
