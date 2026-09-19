@@ -34,6 +34,8 @@ impl Estimator {
 
 const SMOOTHING: f64 = 0.2;
 const SNAP: f64 = 0.1;
+// how close a ratio must be to a simple fraction for its slot pattern to lock to it
+const FRACTION: f64 = 0.02;
 const CAP_AFTER: u32 = 10;
 const PROBE_AFTER: u32 = 60;
 // frames a probe lasts; the first carries the game's catch-up after the held frames and is dropped
@@ -127,10 +129,19 @@ impl Pacer {
                 return self.lock(1);
             }
         }
-        let ratio = self.estimate / self.refresh;
+        let mut ratio = self.estimate / self.refresh;
         let rounded = ratio.round();
         if (ratio - rounded).abs() < SNAP || rounded >= self.cap as f64 {
             return self.lock((rounded as usize).clamp(1, self.cap));
+        }
+        // a ratio near a/b keeps the phase on multiples of 1/b, so one frame in b ends on its original
+        if let Some((a, b)) = (2..=5).map(f64::from).find_map(|b| {
+            let a = (ratio * b).round();
+            ((ratio - a / b).abs() < FRACTION).then_some((a, b))
+        }) {
+            ratio = a / b;
+            let j = (self.phase * b).round();
+            self.phase = if j < 1.0 { 1.0 } else { j / b };
         }
         let mut out = Vec::new();
         let mut slot = self.phase;
@@ -297,6 +308,30 @@ mod tests {
             first.len() == 1 && (first[0] - 1.0 / 1.2).abs() < 1e-9,
             "{first:?}"
         );
+    }
+
+    #[test]
+    fn simple_fractions_end_on_the_original() {
+        // frames of the 200 that end on their original, from a phase where none would
+        let originals = |interval: f64, jitter: f64, phase: f64| {
+            let mut p = Pacer::new(REFRESH, 4);
+            p.estimate = interval;
+            p.phase = phase;
+            (0..200)
+                .filter(|i| {
+                    let d = if i % 2 == 0 { jitter } else { -jitter };
+                    check(&mut p, trusted(interval + d)).last() == Some(&1.0)
+                })
+                .count()
+        };
+        // 40 fps on 60 hz shows every second original, 45 fps every third
+        assert_eq!(originals(1.5 * REFRESH, 0.0, 0.75), 100);
+        assert_eq!(originals(1.5 * REFRESH, 0.0002, 0.75), 100);
+        assert!((66..=67).contains(&originals(4.0 / 3.0 * REFRESH, 0.0, 0.5)));
+        // a ratio away from any simple fraction keeps its average
+        let mut p = Pacer::new(REFRESH, 4);
+        let n = total(&mut p, trusted(1.7 * REFRESH), 100);
+        assert!((168..=172).contains(&n), "{n}");
     }
 
     #[test]
