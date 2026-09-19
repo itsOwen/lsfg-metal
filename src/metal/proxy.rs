@@ -330,7 +330,7 @@ impl ProxySwapchain {
                 }
             }
             if !ok {
-                log::warn("Vulkan proxy present needs unsupported metadata or queues; recreating with fixed pacing");
+                log::warn("Vulkan proxy present needs unsupported metadata or queues; recreating on the fixed present path");
                 self.invalidate_locked(queue, Some(info));
                 return vk::Result::ERROR_OUT_OF_DATE_KHR;
             }

@@ -149,6 +149,34 @@ enabling generation does not require switching it to Vulkan.
 Instead of the symlink you can point `LSFGM_MOLTENVK` at the real driver, under any name other
 than `libMoltenVK.dylib`.
 
+### CrossOver
+
+CrossOver removes `DYLD_*` variables before it starts Wine, so the shim has to replace CrossOver's own
+MoltenVK. CrossOver 26 ships MoltenVK 1.2.10, which is too old for frame generation, so the
+generator also needs a newer MoltenVK of its own. Tested with CrossOver 26.3 on D3DMetal, DXMT, DXVK,
+WineD3D and an OpenGL game.
+
+1. Quit CrossOver. In `CrossOver.app/Contents/SharedSupport/CrossOver/lib64/`, rename
+   `libMoltenVK.dylib` to `libMoltenVK.real.dylib` and copy the shim in as `libMoltenVK.dylib`.
+   macOS only allows this from an app with App Management permission (System Settings, Privacy &
+   Security), and a CrossOver update undoes it.
+2. Get MoltenVK 1.3 or newer, for example `MoltenVK-macos.tar` from the
+   [official releases](https://github.com/KhronosGroup/MoltenVK/releases), whose
+   `MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` contains x86_64. Keep it outside the app.
+3. Add the variables to the bottle's `cxbottle.conf` under `[EnvironmentVariables]`:
+
+```ini
+"LSFGM_ENV" = "1"
+"LSFGM_MULTIPLIER" = "2"
+"LSFGM_METAL" = "1"
+"LSFGM_DLL_PATH" = "/path/to/Lossless Scaling/lsfg-vk.dll"
+"LSFGM_GENERATOR_MOLTENVK" = "/path/to/newer/libMoltenVK.dylib"
+```
+
+Use `LSFGM_GENERATOR_MOLTENVK`, not `LSFGM_MOLTENVK`, for the newer driver: CrossOver's DXVK and
+WineD3D only start on CrossOver's own MoltenVK, and `LSFGM_MOLTENVK` would change the driver the
+game uses as well.
+
 ## Configuration, environment mode
 
 Setting `LSFGM_ENV` (any value, including empty) skips the config file entirely: the settings
@@ -171,7 +199,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_GENERATOR_MOLTENVK` | MoltenVK for the shim's own generation device only; the game keeps the real driver | path to a MoltenVK, 1.3 or newer | unset, the real driver |
 | `LSFGM_METAL` | enable the Metal front end, OpenGL included | enabled when set, non-empty and not `0` | unset |
 | `LSFGM_OPENGL` | enable only the OpenGL front end; ignored when `LSFGM_METAL` is on | enabled when set, non-empty and not `0` | unset |
-| `LSFGM_VULKAN_PROXY` | proxy swapchain for adaptive pacing on the Vulkan path | `0` disables it and forces the fixed present path | unset, proxy used when supported |
+| `LSFGM_VULKAN_PROXY` | proxy swapchain on the Vulkan path, generating on the shim's own device | `0` disables it and forces the fixed present path | unset, proxy used when supported |
 | `LSFGM_TARGET_FPS` | override the display refresh used by the pacer | finite positive float, whole string | unset, the main screen's rate |
 | `LSFGM_STATS` | periodic statistics lines | read by **presence** | unset |
 | `LSFGM_LATENCY` | Metal presentation latency, p50/p95 every 120 callbacks per frame kind | read by **presence** | unset |
@@ -331,10 +359,13 @@ On the Metal path a frame cap implemented by holding the drawable
 as a trusted sample of that duration, and the requested duration is divided by the number of frames
 shown so the inserted frames fit inside it.
 
-On the Vulkan path adaptive pacing needs the proxy swapchain, because the present hook cannot
-otherwise measure the game's own frame time. Set `LSFGM_VULKAN_PROXY=0` to disable the proxy and
-force the fixed present path. If the proxy cannot be created the shim falls back on its own and logs
-`Vulkan proxy swapchain failed, using the fixed present path: <what>`.
+On the Vulkan path generation goes through the proxy swapchain in both pacing modes: the game
+renders into Metal textures owned by the shim, and the Metal front end's own device generates and
+presents. The game's MoltenVK therefore only needs `VK_EXT_metal_objects`, not version 1.3, and the
+pacer can measure the game's own frame time. Set `LSFGM_VULKAN_PROXY=0` to disable the proxy and
+force the fixed present path, which generates on the game's device, supports fixed pacing only and
+needs the game's MoltenVK to be 1.3 or newer. If the proxy cannot be created the shim falls back on
+its own and logs `Vulkan proxy swapchain failed, using the fixed present path: <what>`.
 
 ## Logging and diagnostics
 
@@ -360,13 +391,13 @@ At startup the shim logs the version, the profile and its settings:
 (lsfg-metal) [INFO]:   Performance mode: false
 ```
 
-**`LSFGM_STATS`.** On the Vulkan fixed path, every 60th original present:
+**`LSFGM_STATS`.** On the Vulkan fixed present path, every 60th original present:
 
 ```
 Frame generation stats pid=<pid> original=<o> generated=<g> total=<o+g> (successful presents on this swapchain)
 ```
 
-On the Metal path, every 60th source frame:
+On the Metal path and the Vulkan proxy, every 60th source frame:
 
 ```
 Frame generation stats pid=<pid> source=<s> original=<o> generated=<g> total=<o+g> source_fps=<fps> slots=<histogram> (metal presents on this layer)
@@ -553,8 +584,9 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
 
 ## Limitations
 
-* HDR10 has not been tested on an HDR display. Adaptive pacing falls back to fixed pacing for HDR10
-  and for float sRGB swapchains, because its proxy only presents sRGB and scRGB.
+* HDR10 has not been tested on an HDR display. The proxy swapchain only presents sRGB and scRGB, so
+  HDR10 and float sRGB swapchains use the fixed present path: fixed pacing, generated on the game's
+  device, which needs the game's MoltenVK to be 1.3 or newer.
 * Multi-GPU Intel Macs are not handled. The Metal front end's private backend takes the first
   enumerated Vulkan device, which is the layer's device on every Apple Silicon Mac but is not
   guaranteed to be on a two-GPU Intel Mac.
@@ -567,7 +599,7 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
   presents on a queue other than the adopted one. Presentation extension payloads are not in that
   list: the fixed path forwards the payload on the original present and still generates. Only the
   proxy swapchain is restrictive, accepting `VK_KHR_incremental_present` (`VkPresentRegionsKHR`)
-  and recreating with fixed pacing for any other payload.
+  and recreating on the fixed present path for any other payload.
 
 ## Affiliation and disclaimer
 

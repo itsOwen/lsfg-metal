@@ -1207,10 +1207,9 @@ unsafe fn choose_wrapper(
 ) -> Result<(Created, bool), Error> {
     let h = dev.hook.as_ref().expect("hooked device");
     let profile = layer().expect("active layer").profile();
-    // multiplier 1 generates nothing, so the fixed path's plain forwarding is the right shape for it
+    // the proxy generates on the shim's own device in both pacing modes; multiplier 1 keeps plain forwarding
     if h.proxy_supported.load(Ordering::Relaxed)
         && profile.multiplier > 1
-        && profile.pacing_mode == settings::PacingMode::Adaptive
         && settings::os_env("LSFGM_VULKAN_PROXY").as_deref() != Some("0")
     {
         match proxy::create(dev, ci) {
