@@ -354,10 +354,12 @@ extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
 
-// LSFGM_MOLTENVK, else libMoltenVK.real.dylib beside this library
+// LSFGM_GENERATOR_MOLTENVK, else LSFGM_MOLTENVK, else libMoltenVK.real.dylib beside this library
 fn driver_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("LSFGM_MOLTENVK").filter(|p| !p.is_empty()) {
-        return Some(p.into());
+    for k in ["LSFGM_GENERATOR_MOLTENVK", "LSFGM_MOLTENVK"] {
+        if let Some(p) = std::env::var_os(k).filter(|p| !p.is_empty()) {
+            return Some(p.into());
+        }
     }
     let mut info = DlInfo {
         fname: std::ptr::null(),

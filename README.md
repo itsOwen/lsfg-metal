@@ -96,7 +96,9 @@ driver and the `nextDrawable` hook returns the original drawable. It is a transp
   That driver release requires macOS 12 or newer.
 * MoltenVK 1.3 or newer for frame generation itself. MoltenVK 1.2.x compiles the shaders but writes
   black generated frames, so the shim refuses it, logs `MoltenVK <version> is too old for frame
-  generation`, and the game presents natively.
+  generation`, and the game presents natively. The Metal front end and the Vulkan proxy generate on
+  the shim's own Vulkan device, so `LSFGM_GENERATOR_MOLTENVK` can point them at a newer MoltenVK
+  than the one the game uses.
 * macOS 11 or newer (the deployment target of this crate).
 * Your own `lsfg-vk.dll` from the *Lossless Scaling* Steam application, which you can buy at
   <https://store.steampowered.com/app/993090/>. Select the **`lsfg-vk` beta branch** under
@@ -166,6 +168,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_LOG_LEVEL` | log level | `debug`, `info`, `warning`, `error` | `info` |
 | `LSFGM_LOG_FILE` | append logs to this file as well as stderr | path | unset |
 | `LSFGM_MOLTENVK` | real driver path | path to the real MoltenVK, any leaf name but `libMoltenVK.dylib` | `libMoltenVK.real.dylib` beside the shim |
+| `LSFGM_GENERATOR_MOLTENVK` | MoltenVK for the shim's own generation device only; the game keeps the real driver | path to a MoltenVK, 1.3 or newer | unset, the real driver |
 | `LSFGM_METAL` | enable the Metal front end, OpenGL included | enabled when set, non-empty and not `0` | unset |
 | `LSFGM_OPENGL` | enable only the OpenGL front end; ignored when `LSFGM_METAL` is on | enabled when set, non-empty and not `0` | unset |
 | `LSFGM_VULKAN_PROXY` | proxy swapchain for adaptive pacing on the Vulkan path | `0` disables it and forces the fixed present path | unset, proxy used when supported |
