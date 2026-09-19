@@ -1,5 +1,6 @@
 // private drawable handed to the game instead of the layer's real drawables
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use block2::RcBlock;
@@ -28,6 +29,8 @@ pub struct Ivars {
     pub id: usize,
     pub state: Mutex<State>,
     pub owner: Option<&'static Generator>,
+    // the texture already went back to the pool
+    pub recycled: AtomicBool,
 }
 
 impl Drop for Ivars {
@@ -35,8 +38,10 @@ impl Drop for Ivars {
         if let Some(r) = self.state.get_mut().unwrap().release.take() {
             r();
         }
-        if let Some(g) = self.owner {
-            g.pool_return(self.texture.clone());
+        if !*self.recycled.get_mut() {
+            if let Some(g) = self.owner {
+                g.pool_return(self.texture.clone());
+            }
         }
     }
 }
@@ -110,6 +115,7 @@ impl ProxyDrawable {
             id,
             state: Mutex::default(),
             owner,
+            recycled: AtomicBool::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -120,6 +126,16 @@ impl ProxyDrawable {
 
     pub fn owner(&self) -> Option<&'static Generator> {
         self.ivars().owner
+    }
+
+    // returns the texture even when the game still holds the drawable, as the layer's own do
+    pub fn recycle(&self) {
+        let iv = self.ivars();
+        if !iv.recycled.swap(true, Ordering::AcqRel) {
+            if let Some(g) = iv.owner {
+                g.pool_return(iv.texture.clone());
+            }
+        }
     }
 
     pub fn set_release(&self, f: impl FnOnce() + Send + 'static) {

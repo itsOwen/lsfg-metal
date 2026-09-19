@@ -1325,9 +1325,19 @@ fn present(
 }
 
 // the game's presented handlers fire with the real drawable's time
+// dropped with the handler when the shown frame leaves the screen, which recycles the proxy
+struct Recycle(Retained<ProxyDrawable>);
+
+impl Drop for Recycle {
+    fn drop(&mut self) {
+        self.0.recycle();
+    }
+}
+
 fn forward_presented(proxy: Retained<ProxyDrawable>, shown: &ProtocolObject<dyn CAMetalDrawable>) {
+    let proxy = Recycle(proxy);
     let block = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
-        proxy.presented(unsafe { d.as_ref() }.presentedTime())
+        proxy.0.presented(unsafe { d.as_ref() }.presentedTime())
     });
     unsafe { shown.addPresentedHandler(RcBlock::as_ptr(&block)) };
 }
