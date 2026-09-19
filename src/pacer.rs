@@ -51,6 +51,8 @@ pub struct Pacer {
     probing: u32,
     probes: Vec<f64>,
     phase: f64,
+    // slot counts of the last frames, which may still be queued ahead of this one
+    shown: [usize; 4],
     histogram: [u32; 9],
 }
 
@@ -70,6 +72,7 @@ impl Pacer {
             probing: 0,
             probes: Vec::new(),
             phase: 1.0,
+            shown: [0; 4],
             histogram: [0; 9],
         }
     }
@@ -87,7 +90,10 @@ impl Pacer {
         {
             return self.lock(1);
         }
-        if sample.trusted {
+        // a frame slower than any queued frame's slots left the display idle, so it was not ahead
+        let queued = self.shown.iter().max().copied().unwrap_or(0);
+        let behind = queued > 0 && interval > (queued as f64 + 0.5) * self.refresh;
+        if sample.trusted || behind {
             self.untrusted = 0;
             self.cadence = 0.0;
             if self.probing > 0 {
@@ -152,6 +158,8 @@ impl Pacer {
     }
 
     fn count(&mut self, out: Vec<f64>) -> Vec<f64> {
+        self.shown.rotate_right(1);
+        self.shown[0] = out.len();
         self.histogram[out.len().min(8)] += 1;
         out
     }
@@ -317,7 +325,11 @@ mod tests {
             assert_eq!(check(&mut p, untrusted(1.0 / 30.0)).len(), 2);
         }
         assert_eq!(check(&mut p, untrusted(1.0 / 30.0)), [1.0]);
-        assert_eq!(total(&mut p, untrusted(1.0 / 30.0), 100), 100);
+        // a probe on a game slower than its one slot sees the idle display and returns to two
+        let first: Vec<usize> = (0..10)
+            .map(|_| check(&mut p, untrusted(1.0 / 30.0)).len())
+            .collect();
+        assert_eq!(first, [1, 1, 1, 1, 1, 1, 2, 2, 2, 2]);
         // 60 trusted, 59 untrusted keep 2, the 60th probes, a trusted sample restores 2
         let mut p = Pacer::new(REFRESH, 4);
         assert_eq!(total(&mut p, trusted(1.0 / 30.0), 60), 120);
@@ -331,8 +343,8 @@ mod tests {
         assert_eq!(check(&mut p, trusted(1.2 / 60.0)).len(), 1);
         assert_eq!(p.interval(), 1.2 / 60.0);
         // a capped game catching up after held frames, then a hitch: measured in slay the spire
-        total(&mut p, untrusted(1.0 / 30.0), 59);
-        assert_eq!(check(&mut p, untrusted(1.0 / 30.0)), [1.0]);
+        total(&mut p, untrusted(1.2 / 60.0), 59);
+        assert_eq!(check(&mut p, untrusted(1.2 / 60.0)), [1.0]);
         for ms in [10.3, 29.8, 32.2] {
             assert_eq!(check(&mut p, trusted(ms / 1000.0)), [1.0]);
         }
@@ -345,6 +357,19 @@ mod tests {
             let n = check(&mut p, untrusted(1.0 / 30.0)).len();
             assert_eq!(n, if i < 9 { 3 } else { 2 }, "frame {i}");
         }
+    }
+
+    #[test]
+    fn present_thread_blocked_for_the_whole_interval() {
+        // an emulator presenting from its own thread waits in the hooks for nearly every frame
+        // while its other threads render at 23 fps: measured in bloodborne on shadps4
+        let mut p = Pacer::new(REFRESH, 3);
+        total(&mut p, trusted(REFRESH), 10);
+        total(&mut p, untrusted(0.043), 120);
+        let n = total(&mut p, untrusted(0.043), 60);
+        // the cap of three, less one short probe
+        assert!(n >= 150, "{n}");
+        assert_eq!(p.interval(), 0.043);
     }
 
     #[test]
