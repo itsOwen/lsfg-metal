@@ -186,7 +186,8 @@ A native Apple Silicon game that draws with Metal can use the Metal front end di
 arm64 build of the shim: download `lsfg-v<version>-arm64.tar.xz` from the
 [releases](https://github.com/itsOwen/lsfg-metal/releases), or build it with
 `cargo build --release --target aarch64-apple-darwin`. Tested with the native Valheim (Unity) at
-2x: about 28 source fps shown at about 56, with a frame dump confirming the generated frames.
+2x: about 28 source fps shown at about 56, with a frame dump confirming the generated frames, and
+with Cemu (Wii U) on its Metal backend at 2x: Breath of the Wild capped at 30 fps shown at about 60.
 
 ```sh
 cd "/path/to/steamapps/common/Valheim"
@@ -234,7 +235,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_METAL_DUMP` | frame dump directory (Metal path) | directory path | unset |
 | `LSFGM_CONFIG` | configuration file path, used verbatim and highest precedence | path; must exist or loading fails | unset |
 | `LSFGM_PROFILE` | select a profile by exact name | profile name | unset |
-| `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.4.0` |
+| `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.5.0` |
 
 Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_STATS`,
 `LSFGM_PACE_DEBUG` and `LSFGM_LATENCY`. Every other variable is read by value and is only
@@ -498,24 +499,27 @@ Version string. Two independent steps derive one, and they use different rules.
   `LSFGM_VERSION` when that is set and non-empty. Otherwise it asks git for the short HEAD sha and
   the nearest tag: exactly on a tag the version is the tag, otherwise `<tag>.r<commits>.g<sha>`,
   with `unknown` in place of the tag when the repository has none, and `-dirty` appended when
-  tracked files are modified. With no git at all it falls back to `0.4.0`.
+  tracked files are modified. With no git at all it falls back to `0.5.0`.
 * `Scripts/package.sh` writes the version in `source.txt`. It takes `LSFGM_VERSION` when set,
-  otherwise `git describe --tags --always --dirty`, otherwise `0.4.0`.
+  otherwise `git describe --tags --always --dirty`, otherwise `0.5.0`.
 
 The script does not build, so the compiled-in version and `source.txt` agree only when
 `LSFGM_VERSION` is exported for both the `cargo build` and the packaging step. Left to their own
 git queries the two produce different strings from the same commit.
 
 Export check. The shim carries the driver's install name (`@rpath/libMoltenVK.dylib`) and must
-export exactly the four functions Wine `dlsym`s:
+export exactly the eight functions a caller resolves by symbol:
 
 ```sh
-nm -gU dist/renderers/lsfg/libMoltenVK.dylib | awk '$2=="T"' | wc -l   # must be 4
+nm -gU dist/renderers/lsfg/libMoltenVK.dylib | awk '$2=="T"' | wc -l   # must be 8
 ```
 
-The four are `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`, `vkCreateMetalSurfaceEXT` and
-`vkCreateMacOSSurfaceMVK`. Every other entry point is reachable only through the two `ProcAddr`
-functions. `objc2`'s class data statics are also exported, and that is expected: `rustc` owns the
+Wine `dlsym`s `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`, `vkCreateMetalSurfaceEXT` and
+`vkCreateMacOSSurfaceMVK`. A native app that loads the driver itself also takes the global entry
+points from it, so the shim exports `vkCreateInstance`, `vkEnumerateInstanceExtensionProperties`,
+`vkEnumerateInstanceVersion` and `vkEnumerateDeviceExtensionProperties`; without them such an app
+gives up on Vulkan (Cemu logs `vkEnumerateInstanceVersion not available`). Every other entry point
+is reachable only through the two `ProcAddr` functions. `objc2`'s class data statics are also exported, and that is expected: `rustc` owns the
 export list for a `cdylib` and adding a second `-exported_symbol` flag makes the linker refuse the
 link. They are data symbols, not text symbols, which is why the check filters on `T`.
 
