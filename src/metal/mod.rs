@@ -8,7 +8,7 @@ mod proxy;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use ash::vk;
 use objc2_metal::MTLPixelFormat;
@@ -65,16 +65,21 @@ impl Setup {
     }
 }
 
-static SETUP: OnceLock<Setup> = OnceLock::new();
+// the active setup: a front end publishes it as it activates, and the worker
+// republishes it when a hot-reloaded config changes the profile
+// (see generator::Worker::maybe_reload)
+static SETUP: Mutex<Option<&'static Setup>> = Mutex::new(None);
 
-// pushed by a front end as it activates; the first push wins
+// each publish leaks one Setup (a few hundred bytes); the count is bounded by
+// how often the config file is edited while a game runs
 pub fn init(setup: Setup) {
-    let _ = SETUP.set(setup);
+    let leaked: &'static Setup = Box::leak(Box::new(setup));
+    *SETUP.lock().unwrap() = Some(leaked);
 }
 
 // None until a front end has pushed its configuration
 pub fn setup() -> Option<&'static Setup> {
-    SETUP.get()
+    *SETUP.lock().unwrap()
 }
 
 // metal to vulkan format map

@@ -27,7 +27,7 @@ use super::{enabled, hooks, set_enabled, setup, vk_format, Setup};
 use crate::generator::{Context, Instance};
 use crate::log;
 use crate::pacer::{display_refresh, Estimator, Pacer, Sample};
-use crate::settings::PacingMode;
+use crate::settings::{self, PacingMode};
 use crate::vkutil::{self, check};
 
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
@@ -773,10 +773,16 @@ struct Worker {
     stats: Stats,
     stats_on: bool,
     dump_dir: Option<PathBuf>,
+    // file mode only: polls the config file's mtime so profile edits apply without a restart
+    watcher: Option<settings::Watcher>,
 }
 
 impl Worker {
     fn new(gen: &'static Generator) -> Worker {
+        // same rule as the vulkan path: environment mode has no file to poll
+        let watcher = settings::os_env("LSFGM_ENV")
+            .is_none()
+            .then(|| settings::Watcher::new(settings::config_path(&settings::os_env)));
         Worker {
             gen,
             setup: setup().expect("worker without a profile"),
@@ -796,6 +802,7 @@ impl Worker {
             dump_dir: std::env::var_os("LSFGM_METAL_DUMP")
                 .filter(|d| !d.is_empty())
                 .map(PathBuf::from),
+            watcher,
         }
     }
 
@@ -823,6 +830,7 @@ impl Worker {
 
     fn process(&mut self, job: &mut Job) {
         job.latency.start();
+        self.maybe_reload();
         if job.sample.interval.is_finite() && job.sample.interval > 0.0 {
             self.stats.seconds += job.sample.interval;
             self.stats.samples += 1;
@@ -845,6 +853,46 @@ impl Worker {
                 self.present_natively(job);
             }
         }
+    }
+
+    // config hot reload: poll the config file once per frame (file mode only, same
+    // rule as the vulkan path) and republish the setup when the active profile
+    // changed; prepare() then rebuilds the context through its size/format gate
+    fn maybe_reload(&mut self) {
+        let Some(w) = self.watcher.as_mut() else { return };
+        let cfg = match w.check_and_reload(&settings::os_env) {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => return,
+            Err(e) => {
+                log::warn(&format!(
+                    "hot reload failed, keeping the current profile: {e}"
+                ));
+                return;
+            }
+        };
+        let Some((idx, _)) = settings::identify(&cfg) else {
+            log::warn("hot reload: no profile matches anymore, keeping the current one");
+            return;
+        };
+        let next = cfg.profiles[idx].clone();
+        if next == self.setup.profile {
+            return;
+        }
+        log::info(&format!(
+            "hot reload applied: profile '{}' (multiplier {}, {}, flow {:.2}, performance {})",
+            next.name,
+            next.multiplier,
+            next.pacing_mode.name(),
+            next.flow_scale,
+            next.performance_mode
+        ));
+        super::init(Setup::new(next, cfg.allow_half_precision, cfg.dll.clone()));
+        if let Some(s) = setup() {
+            self.setup = s;
+        }
+        // invalidate the size/format gate so prepare() rebuilds on the next frame
+        self.extent = (0, 0);
+        self.format = vk::Format::UNDEFINED;
     }
 
     // idle and drop the context, clear the imports
