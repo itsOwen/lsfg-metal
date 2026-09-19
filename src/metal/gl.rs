@@ -293,9 +293,6 @@ unsafe fn generate(
             p.performance_mode,
             adaptive,
         )?;
-        if p.override_present_mode {
-            CGLSetParameter(cgl, CGL_SWAP_INTERVAL, &1);
-        }
         let mode = if adaptive {
             "adaptive up to"
         } else {
@@ -306,6 +303,10 @@ unsafe fn generate(
             extent.0, extent.1, p.multiplier
         ));
         front.contexts.insert(key, c);
+    }
+    // every frame: the game or wine can reset the swap interval after the context was set up
+    if p.override_present_mode {
+        CGLSetParameter(cgl, CGL_SWAP_INTERVAL, &1);
     }
     let c = front.contexts.get_mut(&key).unwrap();
     // time held in generated swaps makes the sample untrusted; the pacer then probes with the original alone
