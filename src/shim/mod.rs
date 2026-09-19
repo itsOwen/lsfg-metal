@@ -101,7 +101,7 @@ pub trait Swapchain: Send + Sync {
 pub type Created = (vk::SwapchainKHR, Box<dyn Swapchain>);
 
 pub struct Driver {
-    _lib: libloading::os::unix::Library,
+    lib: libloading::os::unix::Library,
     pub entry: ash::Entry,
     pub gipa: vk::PFN_vkGetInstanceProcAddr,
     pub gdpa: vk::PFN_vkGetDeviceProcAddr,
@@ -185,7 +185,7 @@ fn load_driver() -> Option<Driver> {
         })
     };
     Some(Driver {
-        _lib: lib,
+        lib,
         entry,
         gipa,
         gdpa,
@@ -652,6 +652,77 @@ unsafe fn resolve_device(
         return (entry.gdpa)(device, name).and(Some(h));
     }
     (entry.gdpa)(device, name)
+}
+
+// apps that load the driver directly look these globals up by symbol, not through vkGetInstanceProcAddr
+unsafe fn global<F>(name: &CStr) -> Option<F> {
+    vkGetInstanceProcAddr(vk::Instance::null(), name.as_ptr()).map(|f| std::mem::transmute_copy(&f))
+}
+
+/// # Safety
+/// vulkan entry point
+#[no_mangle]
+pub unsafe extern "system" fn vkCreateInstance(
+    info: *const vk::InstanceCreateInfo,
+    alloc: *const vk::AllocationCallbacks,
+    instance: *mut vk::Instance,
+) -> vk::Result {
+    global::<vk::PFN_vkCreateInstance>(c"vkCreateInstance")
+        .map_or(vk::Result::ERROR_INITIALIZATION_FAILED, |f| {
+            f(info, alloc, instance)
+        })
+}
+
+/// # Safety
+/// vulkan entry point
+#[no_mangle]
+pub unsafe extern "system" fn vkEnumerateInstanceExtensionProperties(
+    layer: *const c_char,
+    count: *mut u32,
+    props: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    global::<vk::PFN_vkEnumerateInstanceExtensionProperties>(
+        c"vkEnumerateInstanceExtensionProperties",
+    )
+    .map_or(vk::Result::ERROR_INITIALIZATION_FAILED, |f| {
+        f(layer, count, props)
+    })
+}
+
+/// # Safety
+/// vulkan entry point
+#[no_mangle]
+pub unsafe extern "system" fn vkEnumerateInstanceVersion(version: *mut u32) -> vk::Result {
+    match global::<vk::PFN_vkEnumerateInstanceVersion>(c"vkEnumerateInstanceVersion") {
+        Some(f) => f(version),
+        // a 1.0 driver has no such function
+        None => {
+            *version = vk::API_VERSION_1_0;
+            vk::Result::SUCCESS
+        }
+    }
+}
+
+/// # Safety
+/// vulkan entry point; not hooked, so the driver's own symbol answers
+#[no_mangle]
+pub unsafe extern "system" fn vkEnumerateDeviceExtensionProperties(
+    pd: vk::PhysicalDevice,
+    layer: *const c_char,
+    count: *mut u32,
+    props: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    let f = driver().and_then(|d| {
+        d.lib
+            .get::<vk::PFN_vkEnumerateDeviceExtensionProperties>(
+                b"vkEnumerateDeviceExtensionProperties\0",
+            )
+            .ok()
+            .map(|s| *s)
+    });
+    f.map_or(vk::Result::ERROR_INITIALIZATION_FAILED, |f| {
+        f(pd, layer, count, props)
+    })
 }
 
 // surface exports: register the layer, forward, record (surface -> layer)
