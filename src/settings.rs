@@ -493,7 +493,7 @@ pub fn to_toml(cfg: &Config) -> String {
         )
     }
     let mut out = String::from(
-        "# active_in lists Steam App IDs ($SteamAppId), not executable names\nversion = 2\n\n[global]\n",
+        "# active_in lists Steam App IDs ($SteamAppId) and executable names\nversion = 2\n\n[global]\n",
     );
     if let Some(dll) = &cfg.dll {
         let _ = writeln!(out, "dll = {}", q(dll));
@@ -597,6 +597,7 @@ impl Watcher {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     Environment,
+    Executable,
     SteamAppId,
 }
 
@@ -605,9 +606,53 @@ impl Method {
     pub fn name(self) -> &'static str {
         match self {
             Self::Environment => "environment",
+            Self::Executable => "executable name",
             Self::SteamAppId => "Steam App ID",
         }
     }
+}
+
+// wine keeps the windows .exe in its own argv; a native game has its binary and bundle name
+fn names_from(argv: &[String], exe: Option<&Path>) -> Vec<String> {
+    let base = |s: &str| s.rsplit(['\\', '/']).next().unwrap_or(s).to_string();
+    let mut out: Vec<String> = argv
+        .iter()
+        .filter(|a| a.to_ascii_lowercase().ends_with(".exe"))
+        .map(|a| base(a))
+        .collect();
+    if let Some(exe) = exe {
+        if let Some(n) = exe.file_name().and_then(|n| n.to_str()) {
+            out.push(n.to_string());
+        }
+        // <name>.app/Contents/MacOS/<binary>
+        if let Some(app) = exe
+            .ancestors()
+            .nth(3)
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".app"))
+        {
+            out.push(app.to_string());
+        }
+    }
+    out
+}
+
+fn process_names() -> Vec<String> {
+    // args() would panic on a non-utf8 argument, which a game is free to have
+    let argv: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    names_from(&argv, std::env::current_exe().ok().as_deref())
+}
+
+// first profile listing any of these names in active_in, compared case-insensitively
+fn match_names(cfg: &Config, names: &[String]) -> Option<usize> {
+    cfg.profiles.iter().position(|p| {
+        p.active_in
+            .iter()
+            .any(|a| names.iter().any(|n| a.eq_ignore_ascii_case(n)))
+    })
 }
 
 // no profile means no layer; highball already writes DISABLE_LSFGM, so honour both names
@@ -632,6 +677,9 @@ pub fn identify_with(cfg: &Config, env: Env) -> Option<(usize, Method)> {
         if let Some(i) = cfg.profiles.iter().position(|p| p.name == name) {
             return Some((i, Method::Environment));
         }
+    }
+    if let Some(i) = match_names(cfg, &process_names()) {
+        return Some((i, Method::Executable));
     }
     if let Some(id) = nonempty(env, "SteamAppId") {
         if let Some(i) = cfg.profiles.iter().position(|p| p.active_in.contains(&id)) {
@@ -995,6 +1043,40 @@ mod tests {
             None
         );
         assert_eq!(Method::SteamAppId.name(), "Steam App ID");
+    }
+
+    #[test]
+    fn executable_names() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            names_from(
+                &argv(&[
+                    "/opt/wine/bin/wine64-preloader",
+                    "c:\\Program Files\\Game\\Game.exe",
+                    "-windowed"
+                ]),
+                Some(Path::new("/opt/wine/bin/wine64-preloader"))
+            ),
+            ["Game.exe", "wine64-preloader"]
+        );
+        assert_eq!(
+            names_from(
+                &[],
+                Some(Path::new("/A/Celeste.app/Contents/MacOS/Celeste"))
+            ),
+            ["Celeste", "Celeste"]
+        );
+        assert_eq!(names_from(&argv(&["/x/y"]), None), Vec::<String>::new());
+
+        let mut cfg = Config::default();
+        cfg.profiles.push(Profile {
+            name: "named".into(),
+            active_in: vec!["game.EXE".into()],
+            ..Default::default()
+        });
+        assert_eq!(match_names(&cfg, &argv(&["Game.exe"])), Some(0));
+        assert_eq!(match_names(&cfg, &argv(&["Game"])), None);
+        assert_eq!(Method::Executable.name(), "executable name");
     }
 
     #[test]

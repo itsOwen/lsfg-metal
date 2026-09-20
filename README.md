@@ -314,7 +314,7 @@ preserve_swapchain_image_count = false
 ```
 
 `dll` and `log_file` appear in `[global]` only when set (`~` is expanded on read); `active_in` is a
-string for one ID, an array for several, and omitted for none. `pacing` is accepted as an alias for
+string for one entry, an array for several, and omitted for none. `pacing` is accepted as an alias for
 `pacing_mode`, a `# comment` after any value is accepted, and a key that appears twice takes the
 last value.
 
