@@ -339,20 +339,38 @@ as `(seconds, nanoseconds)`. When the mtime changes it reparses, logs
 `Config file changed on disk, reloading...`, and adopts the profile with the **same name** as the
 active one. If that name is gone the old profile is kept. A parse failure leaves the recorded mtime
 untouched, so the next present retries the same file; this is what covers a half-written file. The
-watcher is not created when `LSFGM_ENV` is set. Only the Vulkan fixed present path checks the
+watcher is not created when `LSFGM_ENV` is set. Only `flow_scale` and `performance_mode` are baked
+into the pipeline, so only those two rebuild it on reload; a new `multiplier` is re-read on the next
+present and costs nothing beyond the extra inner passes it allocates. `override_present_mode` and
+`preserve_swapchain_image_count` are properties of the swapchain itself and are captured when it is
+created, so changing them takes effect only when the game recreates it. Only the Vulkan fixed present path checks the
 watcher: the Metal front end and the Vulkan proxy path capture the profile once when they are set
 up, so a config change does not reach them until the swapchain or layer is rebuilt.
 
 Profile selection order:
 
+0. `LSFGM_DISABLE` or `DISABLE_LSFGM` set: no profile at all, whatever the rest of this list says.
 1. `LSFGM_ENV` set: the synthesised `(environment)` profile, method *environment*.
 2. `LSFGM_PROFILE` non-empty: the profile whose `name` equals it exactly, method *environment*.
    An unmatched name falls through to step 3.
-3. `SteamAppId` non-empty: the first profile whose `active_in` contains exactly that string,
+3. Executable name: the first profile whose `active_in` contains, case-insensitively, any
+   `.exe` on the process's command line (this is where Wine keeps the Windows executable path,
+   so it works in CrossOver bottles and outside Steam), the executable's own file name, or the
+   name of the `.app` bundle it sits in, without the `.app` suffix and only for the exact
+   `<name>.app/Contents/MacOS/<binary>` layout. Method *executable name*.
+4. `SteamAppId` non-empty: the first profile whose `active_in` contains exactly that string,
    method *Steam App ID*.
-4. No match: no profile, and the shim stays passive.
+5. The first profile whose `active_in` contains `"*"`, method *catch-all profile*. It is checked
+   last, so a name or an App ID always wins, which lets one file carry a default for the whole
+   environment next to the per-game profiles.
+6. No match: no profile, and the shim stays passive.
 
-Matching is by `SteamAppId` only; executable names are not inspected.
+`active_in` entries are compared to App IDs exactly and to names case-insensitively, so one list
+can hold both. Only the base name is compared: `active_in = "Game.exe"` matches
+`C:\Program Files\Game\Game.exe`. Every process whose command line carries that name matches, so
+Wine helpers in the launch chain (`start.exe`, `explorer.exe` under a virtual desktop) match too;
+without a swapchain or a Metal layer of their own they load the layer and stay passive. A name that
+is not valid UTF-8 cannot be matched.
 
 ## Adaptive pacing
 

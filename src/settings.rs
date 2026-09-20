@@ -599,6 +599,7 @@ pub enum Method {
     Environment,
     Executable,
     SteamAppId,
+    CatchAll,
 }
 
 impl Method {
@@ -608,6 +609,7 @@ impl Method {
             Self::Environment => "environment",
             Self::Executable => "executable name",
             Self::SteamAppId => "Steam App ID",
+            Self::CatchAll => "catch-all profile",
         }
     }
 }
@@ -685,6 +687,15 @@ pub fn identify_with(cfg: &Config, env: Env) -> Option<(usize, Method)> {
         if let Some(i) = cfg.profiles.iter().position(|p| p.active_in.contains(&id)) {
             return Some((i, Method::SteamAppId));
         }
+    }
+    // checked last, so a name or an app id always wins over a file's default profile
+    let star = "*".to_string();
+    if let Some(i) = cfg
+        .profiles
+        .iter()
+        .position(|p| p.active_in.contains(&star))
+    {
+        return Some((i, Method::CatchAll));
     }
     None
 }
@@ -1077,6 +1088,34 @@ mod tests {
         assert_eq!(match_names(&cfg, &argv(&["Game.exe"])), Some(0));
         assert_eq!(match_names(&cfg, &argv(&["Game"])), None);
         assert_eq!(Method::Executable.name(), "executable name");
+    }
+
+    #[test]
+    fn catch_all_profile_is_last() {
+        let mut cfg = Config::default();
+        cfg.profiles.push(Profile {
+            name: "everything else".into(),
+            active_in: vec!["*".into()],
+            ..Default::default()
+        });
+        cfg.profiles.push(Profile {
+            name: "one game".into(),
+            active_in: vec!["480".into()],
+            ..Default::default()
+        });
+        // the specific profile wins even though the catch-all is listed first
+        assert_eq!(
+            identify_with(&cfg, &env(&[("SteamAppId", "480")])),
+            Some((1, Method::SteamAppId))
+        );
+        assert_eq!(
+            identify_with(&cfg, &env(&[("SteamAppId", "999")])),
+            Some((0, Method::CatchAll))
+        );
+        assert_eq!(identify_with(&cfg, &env(&[])), Some((0, Method::CatchAll)));
+        // and the kill switch still beats everything
+        assert_eq!(identify_with(&cfg, &env(&[("LSFGM_DISABLE", "")])), None);
+        assert_eq!(Method::CatchAll.name(), "catch-all profile");
     }
 
     #[test]
