@@ -80,7 +80,7 @@ fn write_ppm(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), 
 fn run() -> Result<(), String> {
     let (mut w, mut h, mut m, mut flow, mut iters) = (1920u32, 1080u32, 2u32, 1.0f32, 10u32);
     let (mut perf, mut fp16, mut hdr, mut partial) = (false, true, false, false);
-    let (mut input, mut out) = (None, None);
+    let (mut bench, mut input, mut out) = (false, None, None);
     let mut driver = env("LSFGM_MOLTENVK").map(PathBuf::from);
     let mut dll = env("LSFGM_DLL_PATH")
         .map(PathBuf::from)
@@ -100,9 +100,10 @@ fn run() -> Result<(), String> {
             "--no-fp16" => fp16 = false,
             "--hdr" => hdr = true,
             "--partial" => partial = true,
+            "--bench" => bench = true,
             "--in" => input = Some((PathBuf::from(val()?), PathBuf::from(val()?))),
             "--out" => out = Some(PathBuf::from(val()?)),
-            _ => return Err("usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow] [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--in a.ppm b.ppm] [--out dir]".into()),
+            _ => return Err("usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow] [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench] [--in a.ppm b.ppm] [--out dir]".into()),
         }
     }
     if !(2..=4).contains(&m) || !(0.25..=1.0).contains(&flow) {
@@ -126,6 +127,10 @@ fn run() -> Result<(), String> {
         iters = 2;
     } else if out.is_some() {
         return Err("--out needs --in".into());
+    }
+    if bench && out.is_some() {
+        // in bench mode nothing waits on the generator, so the readback would catch a half-written frame
+        return Err("--bench writes no usable frames, so it cannot be combined with --out".into());
     }
     if w == 0 || h == 0 {
         return Err("size must be positive".into());
@@ -294,10 +299,16 @@ fn run() -> Result<(), String> {
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
         // the previous iteration's last main pass signalled s; do not overwrite its source layer before it is done
-        submit(&[cb], (it > 0).then_some(s), Some(s + 1), vk::Fence::null())?;
-        ctx.dispatch(m - 1, false)?;
+        // --bench drops the caller side of the protocol: nothing waits, one iteration stays in flight
+        submit(
+            &[cb],
+            (it > 0 && !bench).then_some(s),
+            (!bench).then_some(s + 1),
+            vk::Fence::null(),
+        )?;
+        ctx.dispatch(m - 1, bench)?;
         for k in 0..(m - 1) as u64 {
-            ctx.acquire(false, 0.0)?;
+            ctx.acquire(bench, 0.0)?;
             // the last iteration is the one with both input frames in place, so it is the one written out
             let grab = readback.as_ref().filter(|_| it + 1 == iters);
             let (copy, fence) = match grab {
@@ -319,8 +330,8 @@ fn run() -> Result<(), String> {
                 }
                 None => (vec![], vk::Fence::null()),
             };
-            let next = (k + 2 < m as u64).then_some(s + 3 + 2 * k);
-            submit(&copy, Some(s + 2 + 2 * k), next, fence)?;
+            let next = (k + 2 < m as u64 && !bench).then_some(s + 3 + 2 * k);
+            submit(&copy, (!bench).then_some(s + 2 + 2 * k), next, fence)?;
             if let Some((_, mem, fence)) = grab {
                 let px = unsafe {
                     check(
@@ -340,7 +351,9 @@ fn run() -> Result<(), String> {
                 write_ppm(&dir.join(format!("generated_{k}.ppm")), w, h, &px)?;
             }
         }
-        s += 2 * (m as u64 - 1);
+        if !bench {
+            s += 2 * (m as u64 - 1);
+        }
     }
     ctx.idle()?;
     check(unsafe { d.queue_wait_idle(inst.queue) }, "vkQueueWaitIdle")?;

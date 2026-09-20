@@ -572,7 +572,7 @@ centre pixel of the last generated frame.
 
 ```
 usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow]
-                [-n iterations] [-p] [--no-fp16] [--hdr] [--partial]
+                [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench]
                 [--in a.ppm b.ppm] [--out dir]
 ```
 
@@ -582,6 +582,12 @@ with `no driver: pass --driver or set LSFGM_MOLTENVK` or the matching DLL messag
 the regression for an iteration that never submits its completion fence and then returns. A normal
 run, without `--partial`, is the one that asserts the sync semaphore advanced by exactly `2(m-1)`
 per iteration.
+
+`--bench` drops the caller side of the timeline protocol: validate stops waiting on and signalling
+the sync semaphore, which measures the pipeline without caller synchronisation. It does **not**
+overlap iterations: the generator still attaches its completion fence to the last generated frame,
+so the next iteration's `settle` blocks on it either way. The output frames are meaningless in this
+mode, only the milliseconds are.
 
 `--in a.ppm b.ppm` replaces the synthetic clears with two real frames, taking the size from the
 files and running the two iterations that put one frame in each source layer. With `--out dir` each
