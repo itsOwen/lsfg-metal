@@ -2,6 +2,7 @@
 // MTLTEST_FPS paces the source rate, MTLTEST_MINDURATION=<fps> presents with afterMinimumDuration, argv[1] = frame count
 // MTLTEST_WIDTH and MTLTEST_HEIGHT size the window, default 640x480
 // MTLTEST_FORMAT=<raw MTLPixelFormat> sets the layer format; MTLTEST_DOUBLE presents a second layer on the same command buffer
+// MTLTEST_DIRECT presents on the drawable after the commit instead of through the command buffer, ignoring MTLTEST_MINDURATION
 // run with the shim on DYLD_INSERT_LIBRARIES and LSFGM_METAL=1; the example must not link the crate itself
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -42,6 +43,7 @@ fn main() {
     let fps = env_f64("MTLTEST_FPS");
     let min_duration =
         env_f64("MTLTEST_MINDURATION").map(|f| if f <= 1.0 { 1.0 / 60.0 } else { 1.0 / f });
+    let direct = std::env::var_os("MTLTEST_DIRECT").is_some();
 
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -91,7 +93,7 @@ fn main() {
     std::thread::spawn(move || {
         let layer = unsafe { Retained::from_raw(layer_ptr as *mut CAMetalLayer) }.unwrap();
         let second = second.map(|p| unsafe { Retained::from_raw(p as *mut CAMetalLayer) }.unwrap());
-        render(&layer, second.as_deref(), &device, frames, fps, min_duration);
+        render(&layer, second.as_deref(), &device, frames, fps, min_duration, direct);
         std::process::exit(0);
     });
     app.run();
@@ -104,6 +106,7 @@ fn render(
     frames: usize,
     fps: Option<f64>,
     min_duration: Option<f64>,
+    direct: bool,
 ) {
     let queue = device.newCommandQueue().expect("queue");
     let square = {
@@ -199,11 +202,16 @@ fn render(
             }
             blit.endEncoding();
             let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
-            match min_duration {
-                Some(m) => cb.presentDrawable_afterMinimumDuration(d, m),
-                None => cb.presentDrawable(d),
+            if direct {
+                cb.commit();
+                d.present();
+            } else {
+                match min_duration {
+                    Some(m) => cb.presentDrawable_afterMinimumDuration(d, m),
+                    None => cb.presentDrawable(d),
+                }
+                cb.commit();
             }
-            cb.commit();
             shown += 1;
         });
         if let Some(fps) = fps {

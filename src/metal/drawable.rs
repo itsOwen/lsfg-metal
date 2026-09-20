@@ -15,6 +15,7 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use super::generator::{Generator, Job};
 use super::hooks;
+use crate::log;
 
 pub type Handler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLDrawable>>)>;
 
@@ -198,7 +199,16 @@ impl ProxyDrawable {
         };
         let serial = self.ivars().state.lock().unwrap().serial;
         let cb = if serial == 0 {
-            hooks::last_committed()
+            let cb = hooks::last_committed();
+            // the buffer is a guess when the game renders and presents on different threads
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::debug(&format!(
+                    "Metal direct present without a queue signal; pairing with the last committed buffer on this thread (found: {})",
+                    cb.is_some()
+                ));
+            }
+            cb
         } else {
             None
         };
