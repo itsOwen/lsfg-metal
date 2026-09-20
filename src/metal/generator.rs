@@ -380,7 +380,7 @@ fn driver_path() -> Option<PathBuf> {
 }
 
 impl Backend {
-    pub(super) fn create(setup: &Setup) -> Result<Backend, String> {
+    pub(super) fn create(setup: &Setup, gpu: Option<String>) -> Result<Backend, String> {
         // each layer's worker builds its own backend; moltenvk instance creation must not race
         static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _one = CREATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -388,12 +388,16 @@ impl Backend {
         let (lib, entry) = vkutil::load_driver(&path)?;
         let instance = vkutil::create_instance(&entry, c"lsfg-metal", vk::API_VERSION_1_2, false)?;
         let built = (|| {
-            let pd = *check(
-                unsafe { instance.enumerate_physical_devices() },
-                "vkEnumeratePhysicalDevices",
-            )?
-            .first()
-            .ok_or("no Vulkan device")?;
+            // the layer's own gpu, not whichever one moltenvk enumerates first on a two-gpu mac
+            let pd = match gpu.as_deref().filter(|n| !n.is_empty()) {
+                Some(n) => vkutil::select_physical_device(&instance, n).or_else(|_| {
+                    log::warn(&format!(
+                        "No Vulkan device named '{n}'; using the first one"
+                    ));
+                    vkutil::select_physical_device(&instance, "")
+                })?,
+                None => vkutil::select_physical_device(&instance, "")?,
+            };
             let family = vkutil::find_queue_family(
                 &instance,
                 pd,
@@ -863,7 +867,8 @@ impl Worker {
 
     fn backend(&mut self) -> Result<&Backend, Fail> {
         if self.backend.is_none() {
-            self.backend = Some(Backend::create(self.setup)?);
+            let gpu = self.gen.layer.device().map(|d| d.name().to_string());
+            self.backend = Some(Backend::create(self.setup, gpu)?);
         }
         Ok(self.backend.as_ref().unwrap())
     }

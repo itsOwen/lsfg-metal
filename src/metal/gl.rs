@@ -276,7 +276,8 @@ unsafe fn generate(
         return Ok(());
     }
     if front.backend.is_none() {
-        front.backend = Some(Backend::create(s)?);
+        // no metal layer here to take a gpu from, so the first device stands
+        front.backend = Some(Backend::create(s, None)?);
     }
     let b = front.backend.as_ref().unwrap();
     if front.contexts.get(&key).is_none_or(|c| c.extent != extent) {

@@ -644,11 +644,17 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
 * HDR10 has not been tested on an HDR display. The proxy swapchain only presents sRGB and scRGB, so
   HDR10 and float sRGB swapchains use the fixed present path: fixed pacing, generated on the game's
   device, which needs the game's MoltenVK to be 1.3 or newer.
-* Multi-GPU Intel Macs are not handled. The Metal front end's private backend takes the first
-  enumerated Vulkan device, which is the layer's device on every Apple Silicon Mac but is not
-  guaranteed to be on a two-GPU Intel Mac.
+* Multi-GPU Intel Macs are handled by name only. The Metal front end's private backend picks the
+  Vulkan device whose name matches the `MTLDevice` on the layer, and falls back to the first
+  enumerated one with a warning when no name matches. Two identical GPUs in one machine would be
+  indistinguishable this way, and the OpenGL front end has no layer to ask, so it still takes the
+  first device. Untested: no two-GPU Mac here.
 * The refresh rate comes from the main screen only. A game on a secondary display with a different
-  refresh rate is paced against the wrong interval unless `LSFGM_TARGET_FPS` is set.
+  refresh rate is paced against the wrong interval unless `LSFGM_TARGET_FPS` is set. The Metal front
+  end re-reads it whenever it rebuilds, on a size or format change, not continuously.
+* On a hooked instance a queue family is reported as able to present only if it also supports
+  graphics, because the generated frames are blitted on that queue. A game that wanted to present
+  from a compute-only family is told it cannot and picks a graphics family instead.
 * A Wine build with a hardened runtime and no `com.apple.security.cs.allow-dyld-environment-variables`
   entitlement ignores `DYLD_INSERT_LIBRARIES`, so the Metal front end never activates. The same
   applies to any SIP-protected wrapper in the launch chain, which strips `DYLD_*` before exec.
