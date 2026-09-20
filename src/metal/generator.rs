@@ -1051,11 +1051,8 @@ impl Worker {
                     return Err("Metal command buffer did not complete".into());
                 }
             }
-            job.serial = self.gen.next_serial();
-            // never move the shared event backwards
-            if self.gen.game_event.signaledValue() < job.serial {
-                self.gen.game_event.setSignaledValue(job.serial);
-            }
+            // the cpu already waited, so take the held value rather than push the event past the gpu
+            job.serial = self.gen.game_event.signaledValue();
         }
         if job.duration > job.sample.interval {
             job.sample = Sample {
