@@ -1323,25 +1323,32 @@ unsafe extern "system" fn create_swapchain(
         ci.old_swapchain = vk::SwapchainKHR::null();
     }
     let ci = &ci;
+    // the spec retires the old swapchain even when creation fails, so do not name it again
+    let native = || -> Result<vk::SwapchainKHR, vk::Result> {
+        let mut retry = *ci;
+        retry.old_swapchain = vk::SwapchainKHR::null();
+        let mut sc = vk::SwapchainKHR::null();
+        match real(device, &retry, alloc, &mut sc) {
+            vk::Result::SUCCESS => Ok(sc),
+            r => Err(r),
+        }
+    };
     let (sc, wrapper, is_proxy) = match dev.hook.as_ref().and_then(|h| supported(h, ci)) {
         Some(caps) => match choose_wrapper(&dev, ci, &caps, real, alloc) {
             Ok(((sc, w), p)) => (sc, Some(w), p),
+            // a wrapper we cannot build must not take the game's own swapchain down with it
             Err(e) => {
-                let _ = fail(&e.to_string());
-                return match e {
-                    Error::Vk(r) => r,
-                    Error::Msg(_) => vk::Result::ERROR_INITIALIZATION_FAILED,
-                };
+                warn!("Swapchain wrapper failed, presenting natively: {e}");
+                match native() {
+                    Ok(sc) => (sc, None, false),
+                    Err(r) => return r,
+                }
             }
         },
-        None => {
-            let mut sc = vk::SwapchainKHR::null();
-            let r = real(device, ci, alloc, &mut sc);
-            if r != vk::Result::SUCCESS {
-                return r;
-            }
-            (sc, None, false)
-        }
+        None => match native() {
+            Ok(sc) => (sc, None, false),
+            Err(r) => return r,
+        },
     };
     let Some(destroy) =
         dfetch::<vk::PFN_vkDestroySwapchainKHR>(dev.gdpa, device, c"vkDestroySwapchainKHR")
