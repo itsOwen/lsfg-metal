@@ -557,13 +557,14 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 29 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
+**Unit tests.** 34 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, cap
 behaviour, untrusted runs and probing, invalid intervals, the hitch floor on a fast display, a
 closed-loop convergence model), the settings library (environment mode, config path
-precedence, TOML round trip and `~` expansion, error messages, profile identification order, reload
-on mtime change), the PE resource walk, the feature-chain copy, memory type selection, the memory
+precedence, TOML round trip and `~` expansion, error messages, profile identification order including
+the kill switch, executable-name matching and the catch-all profile, reload on mtime change), the refresh-interval
+conversion, the PE resource walk, the feature-chain copy, memory type selection, the memory
 planner, the pipeline signature tables, the recursive mutex, half-float conversion, the
 latency probe's percentiles and the OpenGL state restore.
 
