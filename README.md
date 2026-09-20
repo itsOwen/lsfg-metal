@@ -513,7 +513,8 @@ Scripts/package.sh
 ```
 
 `Scripts/package.sh` does not build. It copies the already built
-`target/x86_64-apple-darwin/release/liblsfg_metal.dylib` into `dist/renderers/lsfg/` as
+`target/$LSFGM_TARGET/release/liblsfg_metal.dylib` (default `x86_64-apple-darwin`, set
+`LSFGM_TARGET=aarch64-apple-darwin` for the native build) into `dist/renderers/lsfg/` as
 `libMoltenVK.dylib`, creates the `libMoltenVK.real.dylib` symlink, copies `LICENSE`, writes
 `source.txt`, ad hoc signs the dylib with `codesign -s - -f`, and verifies the export list.
 
