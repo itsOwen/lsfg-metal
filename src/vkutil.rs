@@ -124,12 +124,15 @@ pub fn check_driver(
     instance: vk::Instance,
     pd: vk::PhysicalDevice,
 ) -> Result<(), String> {
-    // the khr name serves vulkan 1.0 instances; with neither there is no driver id to check
+    // the khr name serves vulkan 1.0 instances; a driver with neither predates the versions that work
     let Some(f) = [c"vkGetPhysicalDeviceProperties2", c"vkGetPhysicalDeviceProperties2KHR"]
         .iter()
         .find_map(|n| unsafe { gipa(instance, n.as_ptr()) })
     else {
-        return Ok(());
+        return Err(
+            "the driver cannot report its version, so it is older than the MoltenVK 1.3 frame generation needs"
+                .into(),
+        );
     };
     let f: vk::PFN_vkGetPhysicalDeviceProperties2 = unsafe { std::mem::transmute(f) };
     let mut driver = vk::PhysicalDeviceDriverProperties::default();
