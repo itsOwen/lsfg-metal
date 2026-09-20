@@ -524,9 +524,9 @@ Version string. Two independent steps derive one, and they use different rules.
   `LSFGM_VERSION` when that is set and non-empty. Otherwise it asks git for the short HEAD sha and
   the nearest tag: exactly on a tag the version is the tag, otherwise `<tag>.r<commits>.g<sha>`,
   with `unknown` in place of the tag when the repository has none, and `-dirty` appended when
-  tracked files are modified. With no git at all it falls back to `0.6.0`.
+  tracked files are modified. With no git at all it falls back to `0.7.0`.
 * `Scripts/package.sh` writes the version in `source.txt`. It takes `LSFGM_VERSION` when set,
-  otherwise `git describe --tags --always --dirty`, otherwise `0.6.0`.
+  otherwise `git describe --tags --always --dirty`, otherwise `0.7.0`.
 
 The script does not build, so the compiled-in version and `source.txt` agree only when
 `LSFGM_VERSION` is exported for both the `cargo build` and the packaging step. Left to their own
