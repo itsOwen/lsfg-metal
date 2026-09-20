@@ -5,10 +5,12 @@ use std::sync::Mutex;
 
 use block2::RcBlock;
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, AnyThread, DefinedClass, Message};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, Message};
 use objc2_foundation::NSObject;
-use objc2_metal::{MTLDrawable, MTLDrawablePresentedHandler, MTLTexture};
+use objc2_metal::{
+    MTL4CommandQueue, MTLDrawable, MTLDrawablePresentedHandler, MTLEvent, MTLTexture,
+};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use super::generator::{Generator, Job};
@@ -19,6 +21,8 @@ pub type Handler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLDrawable>>)>;
 #[derive(Default)]
 pub struct State {
     pub presented_time: f64,
+    // non-zero once a metal 4 queue signalled the game event for this frame
+    pub serial: u64,
     pub handlers: Vec<Handler>,
     pub release: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -89,6 +93,38 @@ define_class!(
         }
     }
 
+    impl ProxyDrawable {
+        // metal 4 drops presentDrawable: and commit, so the queue synchronises with the drawable
+
+        // nothing to wait for: the pool only hands out a texture the worker has finished with
+        #[unsafe(method(waitOnCommandQueue:))]
+        fn __wait_on_command_queue(&self, _queue: *mut AnyObject) {}
+
+        // the game's work on our texture ends here, where commit signalled on the legacy path
+        #[unsafe(method(signalOnCommandQueue:))]
+        fn __signal_on_command_queue(&self, queue: *mut AnyObject) {
+            let Some(gen) = self.ivars().owner else {
+                return;
+            };
+            if queue.is_null() {
+                return;
+            }
+            // a queue that cannot signal events leaves the serial at zero and present falls back
+            let responds: bool =
+                unsafe { msg_send![queue, respondsToSelector: sel!(signalEvent:value:)] };
+            if !responds {
+                return;
+            }
+            let queue = unsafe { &*(queue as *const ProtocolObject<dyn MTL4CommandQueue>) };
+            let serial = gen.next_serial();
+            queue.signalEvent_value(
+                ProtocolObject::<dyn MTLEvent>::from_ref(gen.game_event()),
+                serial,
+            );
+            self.ivars().state.lock().unwrap().serial = serial;
+        }
+    }
+
     unsafe impl CAMetalDrawable for ProxyDrawable {
         #[unsafe(method_id(texture))]
         fn __texture(&self) -> Retained<ProtocolObject<dyn MTLTexture>> {
@@ -155,18 +191,23 @@ impl ProxyDrawable {
         }
     }
 
-    // direct present on our drawable: pair it with the last command buffer the game committed
+    // direct present on our drawable: wait on the serial metal 4 signalled, else the last commit
     fn submit(&self, duration: f64) {
         let Some(gen) = self.ivars().owner else {
             return;
         };
-        let cb = hooks::last_committed();
+        let serial = self.ivars().state.lock().unwrap().serial;
+        let cb = if serial == 0 {
+            hooks::last_committed()
+        } else {
+            None
+        };
         gen.enqueue(Job {
             latency: Default::default(),
             cb,
             drawable: self.retain(),
             duration,
-            serial: 0,
+            serial,
             sample: gen.frame_sample(),
         });
     }

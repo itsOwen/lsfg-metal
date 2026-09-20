@@ -34,6 +34,10 @@ Three hooks cover the renderers a Wine bottle can use:
 | OpenGL games | OpenGL hook (`-[NSOpenGLContext flushBuffer]`) |
 | Native macOS games on Metal (arm64 build) | Metal hook |
 
+* The Metal hook covers both presentation models: `presentDrawable:` and `commit` on the command
+  buffer, and Metal 4, where the queue waits on and signals the drawable and the drawable is
+  presented directly. D3DMetal 4 (Game Porting Toolkit 4) uses Metal 4 by default on macOS 27,
+  tested with Codename CURE II and Absolute Drift under CrossOver 26.3.
 * Multipliers 2 to 4. Multiplier 1 is accepted in a config file and disables generation; above 4 is
   rejected by the settings library.
 * Pacing: fixed (`vsync`, evenly spaced timestamps `1/m .. m/m`) and adaptive (the pacer fits
