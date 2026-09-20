@@ -610,12 +610,20 @@ impl Method {
     }
 }
 
+// no profile means no layer; highball already writes DISABLE_LSFGM, so honour both names
+pub fn disabled(env: Env) -> bool {
+    env("LSFGM_DISABLE").is_some() || env("DISABLE_LSFGM").is_some()
+}
+
 // profile index and how it was identified
 pub fn identify(cfg: &Config) -> Option<(usize, Method)> {
     identify_with(cfg, &os_env)
 }
 
 pub fn identify_with(cfg: &Config, env: Env) -> Option<(usize, Method)> {
+    if disabled(env) {
+        return None;
+    }
     if env("LSFGM_ENV").is_some() {
         return cfg.profiles.first().map(|_| (0, Method::Environment));
     }
@@ -969,6 +977,21 @@ mod tests {
         );
         assert_eq!(
             identify_with(&Config::default(), &env(&[("LSFGM_ENV", "1")])),
+            None
+        );
+        assert_eq!(
+            identify_with(
+                &cfg,
+                &env(&[
+                    ("LSFGM_DISABLE", ""),
+                    ("LSFGM_ENV", "1"),
+                    ("SteamAppId", "480")
+                ])
+            ),
+            None
+        );
+        assert_eq!(
+            identify_with(&cfg, &env(&[("DISABLE_LSFGM", "1"), ("SteamAppId", "480")])),
             None
         );
         assert_eq!(Method::SteamAppId.name(), "Steam App ID");

@@ -264,7 +264,9 @@ impl Layer {
         let config = settings::load()?;
         let Some((profile, method)) = settings::identify(&config) else {
             // a misspelt LSFGM_PROFILE is the one miss worth reporting; unrelated processes stay quiet
-            if let Some(name) = settings::os_env("LSFGM_PROFILE").filter(|n| !n.is_empty()) {
+            let name = settings::os_env("LSFGM_PROFILE")
+                .filter(|n| !n.is_empty() && !settings::disabled(&settings::os_env));
+            if let Some(name) = name {
                 if let Some(f) = &config.log_file {
                     log::set_file(f);
                 }
@@ -1760,6 +1762,10 @@ unsafe extern "system" fn destroy_surface(
 
 extern "C" fn constructor() {
     panic_to_log();
+    // the kill switch also keeps the swizzles out, so a disabled shim touches nothing
+    if settings::disabled(&settings::os_env) {
+        return;
+    }
     // the vulkan path initialises lazily inside the exports; the metal front end is armed at load
     let on = |k| settings::os_env(k).is_some_and(|v| !v.is_empty() && v != "0");
     if on("LSFGM_METAL") {

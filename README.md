@@ -239,10 +239,12 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_METAL_DUMP` | frame dump directory (Metal path) | directory path | unset |
 | `LSFGM_CONFIG` | configuration file path, used verbatim and highest precedence | path; must exist or loading fails | unset |
 | `LSFGM_PROFILE` | select a profile by exact name | profile name | unset |
-| `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.6.0` |
+| `LSFGM_DISABLE` | turn the shim off for this process: no profile, no swizzles, every path passes through | read by **presence**, any value including empty | unset |
+| `DISABLE_LSFGM` | the same kill switch under the name Highball already writes when frame generation is off | read by **presence**, any value including empty | unset |
+| `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.7.0` |
 
-Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_STATS`,
-`LSFGM_PACE_DEBUG` and `LSFGM_LATENCY`. Every other variable is read by value and is only
+Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_DISABLE`,
+`DISABLE_LSFGM`, `LSFGM_STATS`, `LSFGM_PACE_DEBUG` and `LSFGM_LATENCY`. Every other variable is read by value and is only
 honoured when non-empty.
 
 The boolean variables do not share one truth rule: the profile flags are true only for `1`,
@@ -255,8 +257,8 @@ they override the file's `[global]` values, also after a reload. The profile var
 (`LSFGM_MULTIPLIER` through `LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT`) are ignored without `LSFGM_ENV`.
 `~` is not expanded in any environment variable; only the file's `dll` and `log_file` get that.
 
-Also consulted: `XDG_CONFIG_HOME` and `HOME` for the config path; `SteamAppId` for profile
-selection; `HOME` and `WINEPREFIX` for DLL discovery; `HOME` and `XDG_CACHE_HOME` for the pipeline
+Also consulted: `XDG_CONFIG_HOME` and `HOME` for the config path; `SteamAppId` and the process's
+own command line for profile selection; `HOME` and `WINEPREFIX` for DLL discovery; `HOME` and `XDG_CACHE_HOME` for the pipeline
 cache directory (`$XDG_CACHE_HOME/lsfg-metal`, else `~/Library/Caches/lsfg-metal`, files
 `cache_{quality|performance}_<driver uuid>.bin`).
 
