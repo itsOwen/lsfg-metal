@@ -57,8 +57,44 @@ fn run() -> Result<(), String> {
         ctx.acquire(true, 0.0)?;
         ctx.dispatch(2, true)?;
         drop(ctx);
+        // the same thing on the signalled protocol, where settle waits on the timelines instead
+        let mut ctx = Context::new(inst.clone(), w, h, flow, perf, hdr)?;
+        let sync = ctx.handles().2;
+        let d = &inst.device;
+        // the owned device is 1.2, so the branch this test exists for must be the one taken
+        assert!(
+            inst.timeline_wait,
+            "vkWaitSemaphores missing on the owned device"
+        );
+        let signal = |wait: Option<u64>, value: u64| -> Result<(), String> {
+            let (ws, wv): (Vec<_>, Vec<_>) = wait.map(|v| (sync, v)).into_iter().unzip();
+            let stages = vec![vk::PipelineStageFlags::TOP_OF_PIPE; ws.len()];
+            let mut tl = vk::TimelineSemaphoreSubmitInfo::default()
+                .wait_semaphore_values(&wv)
+                .signal_semaphore_values(std::slice::from_ref(&value));
+            let info = [vk::SubmitInfo::default()
+                .wait_semaphores(&ws)
+                .wait_dst_stage_mask(&stages)
+                .signal_semaphores(std::slice::from_ref(&sync))
+                .push_next(&mut tl)];
+            check(
+                unsafe { d.queue_submit(inst.queue, &info, vk::Fence::null()) },
+                "vkQueueSubmit",
+            )
+        };
+        signal(None, 1)?;
+        ctx.dispatch(2, false)?;
+        ctx.acquire(false, 0.0)?;
+        // the caller signals ahead of the pre-pass that waits on it: a blocked submit stalls the queue
+        signal(Some(2), 3)?;
+        signal(Some(3), 4)?;
+        // one acquire short of the two dispatched, so the next dispatch settles without a fence
+        ctx.dispatch(2, false)?;
+        ctx.idle()?;
+        check(unsafe { d.queue_wait_idle(inst.queue) }, "vkQueueWaitIdle")?;
+        drop(ctx);
         println!(
-            "partial iteration regression: ok (build {:.0} ms)",
+            "partial iteration regression: ok, unsignaled and signalled (build {:.0} ms)",
             build.as_secs_f64() * 1e3
         );
         return Ok(());

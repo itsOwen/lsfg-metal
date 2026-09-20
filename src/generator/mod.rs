@@ -2,6 +2,7 @@
 pub mod pipeline;
 pub mod signature;
 
+use std::ffi::CStr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -23,6 +24,9 @@ pub struct Instance {
     pub fp16: bool,
     pub shaders: shaders::Library,
     pub log: LogFn,
+    // vkWaitSemaphores is core 1.2; an adopted 1.1 device only has the khr alias, or neither
+    pub timeline_wait: bool,
+    pub timeline_khr: Option<khr::timeline_semaphore::Device>,
     owned: bool,
     leak: bool,
     _driver: Option<libloading::Library>,
@@ -163,6 +167,15 @@ impl Instance {
     ) -> Instance {
         let sync2 = khr::synchronization2::Device::new(&instance, &device);
         let queue = unsafe { device.get_device_queue(family, 0) };
+        // ash installs a panicking stub for an entry point the driver does not have, so probe it
+        let probe = |name: &CStr| unsafe {
+            instance
+                .get_device_proc_addr(device.handle(), name.as_ptr())
+                .is_some()
+        };
+        let timeline_wait = probe(c"vkWaitSemaphores");
+        let timeline_khr = (!timeline_wait && probe(c"vkWaitSemaphoresKHR"))
+            .then(|| khr::timeline_semaphore::Device::new(&instance, &device));
         Instance {
             instance,
             physical_device,
@@ -173,6 +186,8 @@ impl Instance {
             fp16,
             shaders,
             log,
+            timeline_wait,
+            timeline_khr,
             owned,
             leak,
             _driver: driver,
@@ -205,6 +220,7 @@ pub struct Context {
     sync_value: u64,
     internal_value: u64,
     fence_pending: bool,
+    unsignaled: bool,
     pub pipeline: Pipeline,
 }
 
@@ -236,6 +252,7 @@ impl Context {
             sync_value: 0,
             internal_value: 0,
             fence_pending: false,
+            unsignaled: false,
             pipeline,
         })
     }
@@ -271,7 +288,7 @@ impl Context {
     }
 
     // wait for everything submitted so far: the completion fence when pending, else the whole queue
-    // a partial iteration (fewer acquires than total) never submits the fence, so fall back to a full queue wait rather than hang or destroy in-flight work
+    // a partial iteration never submits the fence, and the queue may be the game's own
     fn settle(&mut self, what: &str) -> Result<(), String> {
         let d = &self.inst.device;
         if self.fence_pending {
@@ -280,10 +297,30 @@ impl Context {
             check(unsafe { d.reset_fences(&[self.fence]) }, "vkResetFences")?;
             self.fence_pending = false;
         } else if !self.first {
-            check(
-                unsafe { d.queue_wait_idle(self.inst.queue) },
-                "vkQueueWaitIdle",
-            )?;
+            // the pre-pass signals internal and a signalled acquire signals sync; unsignaled has neither
+            let can_wait = (self.inst.timeline_wait || self.inst.timeline_khr.is_some())
+                && !(self.unsignaled && self.index > 0);
+            if can_wait {
+                let mut sems = vec![self.internal];
+                let mut vals = vec![self.internal_value];
+                if self.index > 0 && !self.unsignaled {
+                    sems.push(self.sync);
+                    vals.push(self.sync_value);
+                }
+                let info = vk::SemaphoreWaitInfo::default()
+                    .semaphores(&sems)
+                    .values(&vals);
+                let r = match &self.inst.timeline_khr {
+                    Some(t) => unsafe { t.wait_semaphores(&info, u64::MAX) },
+                    None => unsafe { d.wait_semaphores(&info, u64::MAX) },
+                };
+                check(r, "vkWaitSemaphores")?;
+            } else {
+                check(
+                    unsafe { d.queue_wait_idle(self.inst.queue) },
+                    "vkQueueWaitIdle",
+                )?;
+            }
         }
         Ok(())
     }
@@ -317,6 +354,7 @@ impl Context {
             fence,
         )?;
         self.fence_pending = total == 0;
+        self.unsignaled = unsignaled;
         self.total = total;
         self.index = 0;
         Ok(())
@@ -350,7 +388,7 @@ impl Context {
         Ok(())
     }
 
-    // wait for the current iteration
+    // only our own submits: a caller sharing this queue drains its own before dropping us
     pub fn idle(&mut self) -> Result<(), String> {
         self.settle("current")
     }
