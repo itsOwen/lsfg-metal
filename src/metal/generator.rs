@@ -876,6 +876,8 @@ impl Worker {
             return Ok(());
         }
         self.reset();
+        // the window may have moved to another display, or the mode changed, since the last build
+        self.refresh = autoreleasepool(|_| display_refresh());
         let p = &self.setup.profile;
         let m = p.multiplier;
         let adaptive = p.pacing_mode == PacingMode::Adaptive;
