@@ -573,6 +573,7 @@ centre pixel of the last generated frame.
 ```
 usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow]
                 [-n iterations] [-p] [--no-fp16] [--hdr] [--partial]
+                [--in a.ppm b.ppm] [--out dir]
 ```
 
 Defaults are 1920x1080, `-m 2`, `-f 1.0`, `-n 10`, quality, fp16 on, SDR. `--driver` falls back to
@@ -581,6 +582,14 @@ with `no driver: pass --driver or set LSFGM_MOLTENVK` or the matching DLL messag
 the regression for an iteration that never submits its completion fence and then returns. A normal
 run, without `--partial`, is the one that asserts the sync semaphore advanced by exactly `2(m-1)`
 per iteration.
+
+`--in a.ppm b.ppm` replaces the synthetic clears with two real frames, taking the size from the
+files and running the two iterations that put one frame in each source layer. With `--out dir` each
+generated frame of the second iteration is written there as `generated_<k>.ppm`, which makes an
+interpolation regression a `cmp` against a golden directory. The readback and the file write happen
+inside the timed section, so ignore the milliseconds when `--out` is used. Binary (P6) 8-bit PPM only, so `--in`
+and `--hdr` are mutually exclusive. For a 40-pixel square moved 120 pixels between the two inputs,
+`-m 4` writes it at +30, +60 and +90.
 
 **`shader-check`.** `shader-check <lsfg-vk.dll>`. No GPU and no driver needed. For every combination
 of quality/performance, fp16/fp32 and SDR/HDR it checks the SPIR-V magic word and compares each
