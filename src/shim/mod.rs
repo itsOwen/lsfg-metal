@@ -1699,14 +1699,19 @@ unsafe extern "system" fn get_past_presentation_timing(
     )
 }
 
-// the proxy reports a nominal 60 hz cycle; a zero would divide games by zero
+// the proxy reports the display the pacer is fitting to; a zero would divide games by zero
 unsafe extern "system" fn get_refresh_cycle_duration(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
     props: *mut vk::RefreshCycleDurationGOOGLE,
 ) -> vk::Result {
     if proxy::is_proxy(swapchain) {
-        (*props).refresh_duration = 16_666_667;
+        // games ask every frame from their own thread, and NSScreen wants the main one, so read once
+        static CYCLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        (*props).refresh_duration = *CYCLE.get_or_init(|| {
+            let secs = objc2::rc::autoreleasepool(|_| crate::pacer::display_refresh());
+            crate::pacer::refresh_nanos(secs)
+        });
         return vk::Result::SUCCESS;
     }
     device_call(
