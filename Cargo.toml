@@ -23,6 +23,11 @@ name = "shader-check"
 test = false
 bench = false
 
+[[bin]]
+name = "doctor"
+test = false
+bench = false
+
 [dependencies]
 ash = { version = "0.38", default-features = false, features = ["std", "debug"] }
 libloading = "0.8"

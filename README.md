@@ -597,6 +597,34 @@ inside the timed section, so ignore the milliseconds when `--out` is used. Binar
 and `--hdr` are mutually exclusive. For a 40-pixel square moved 120 pixels between the two inputs,
 `-m 4` writes it at +30, +60 and +90.
 
+**`doctor`.** Checks an install without launching a game. Every check prints one `ok`, `warn` or
+`FAIL` line; exit 1 if any check failed, 0 otherwise, so a `warn` alone still exits 0.
+
+```
+usage: doctor [--shim libMoltenVK.dylib] [--dll lsfg-vk.dll] [--app the-binary-that-is-injected]
+```
+
+`--shim` is the installed `libMoltenVK.dylib`: doctor confirms it is the shim rather than a real
+MoltenVK an update put back (the shim exports eight functions and `vkCreateDevice` is not one of
+them), reports the version from `source.txt` beside it, and resolves the real driver, which is
+`LSFGM_MOLTENVK` when set and otherwise `libMoltenVK.real.dylib` beside the shim, catching the
+missing file, the dangling symlink and the case where the real driver is the shim again. Without
+`--shim` it still checks the driver named by `LSFGM_MOLTENVK`. It then loads that driver, reports
+its version and **fails** when `VK_EXT_metal_objects` is missing, classifies what a leaf-name
+lookup of `libMoltenVK.dylib` on `DYLD_LIBRARY_PATH` would find (the shim there is the normal
+launcher install and passes; a real MoltenVK there shadows the shim and warns), parses the shader
+DLL and counts modules, checks the pipeline cache directory is writable, and prints the config file
+and the profile that matches doctor's own process. Discovery of the DLL looks inside `WINEPREFIX`,
+which a launcher sets and a shell does not, so a missing DLL is a `warn`, not a failure; a DLL that
+is not named `lsfg-vk.dll` is a failure, because the default Steam branch ships DXBC shaders that
+parse but cannot generate. With `--app` it runs `codesign` on the binary that is actually injected
+(under Wine that is the engine's `wine`/`wineloader`, not the `.app` the user clicks) and fails
+when the hardened runtime, library validation or the restrict flag is set without
+`disable-library-validation` or `allow-dyld-environment-variables`; a path under SIP warns instead,
+since dyld drops `DYLD_*` there whatever the signature says. Because `--shim` loads the shim into
+doctor's own process, doctor sets the kill switch on itself first, so the shim's initializer arms
+nothing.
+
 **`shader-check`.** `shader-check <lsfg-vk.dll>`. No GPU and no driver needed. For every combination
 of quality/performance, fp16/fp32 and SDR/HDR it checks the SPIR-V magic word and compares each
 shader's image `Arrayed` operand against the view type the pipeline binds. On success it prints:
