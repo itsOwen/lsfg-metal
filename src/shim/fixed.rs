@@ -204,7 +204,11 @@ impl Fixed {
         let changed = layer.revision() != self.revision;
         if changed {
             self.revision = layer.revision();
-            self.ctx = None;
+            let profile = layer.profile();
+            // only flow scale and performance mode are built in; multiplier 1 would insert nothing
+            if profile.multiplier < 2 || self.ctx.as_ref().is_none_or(|c| c.stale(&profile)) {
+                self.ctx = None;
+            }
             if std::mem::take(&mut self.failed) {
                 if let Err(e) = self.reset_semaphores() {
                     self.failed = true;

@@ -16,6 +16,8 @@ pub struct Wrapper {
     sync: vk::Semaphore,
     fence: vk::Fence,
     extent: (u32, u32),
+    // the profile fields the pipeline is built from; the rest are re-read per present
+    built: (f32, bool),
     iteration: u32,
     remaining: u32,
     sync_counter: u64,
@@ -51,12 +53,18 @@ impl Wrapper {
             sync,
             fence,
             extent: (w, h),
+            built: (profile.flow_scale, profile.performance_mode),
             iteration: 0,
             remaining: 0,
             sync_counter: 0,
             in_flight: false,
             generated: false,
         })
+    }
+
+    // true when a reloaded profile changes something the pipeline was built from
+    pub fn stale(&self, profile: &Profile) -> bool {
+        self.built != (profile.flow_scale, profile.performance_mode)
     }
 
     fn submit(

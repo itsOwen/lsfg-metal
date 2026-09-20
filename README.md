@@ -295,7 +295,7 @@ breaks later, while the game runs, is different again: the reload keeps the prev
 warns `Keeping the previous frame-generation profile: <error>`.
 
 ```toml
-# active_in lists Steam App IDs ($SteamAppId), not executable names
+# active_in lists Steam App IDs ($SteamAppId) and executable names
 version = 2
 
 [global]
