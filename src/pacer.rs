@@ -187,6 +187,15 @@ impl Pacer {
     }
 }
 
+// a refresh interval in seconds as the nanoseconds vulkan reports; never zero, games divide by it
+pub fn refresh_nanos(secs: f64) -> u64 {
+    if secs.is_finite() && secs > 0.0 {
+        ((secs * 1e9).round() as u64).max(1)
+    } else {
+        16_666_667
+    }
+}
+
 // seconds per display frame: 1/LSFGM_TARGET_FPS, else the main screen's maximum rate, else 60
 pub fn display_refresh() -> f64 {
     let target = std::env::var("LSFGM_TARGET_FPS")
@@ -222,6 +231,17 @@ fn main_screen_fps() -> isize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_nanos_converts_seconds_and_never_returns_zero() {
+        assert_eq!(refresh_nanos(1.0 / 60.0), 16_666_667);
+        assert_eq!(refresh_nanos(1.0 / 120.0), 8_333_333);
+        // a bad reading must not hand the game a zero to divide by
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(refresh_nanos(bad), 16_666_667, "bad input {bad}");
+        }
+        assert!(refresh_nanos(1e-12) >= 1);
+    }
 
     const REFRESH: f64 = 1.0 / 60.0;
 
