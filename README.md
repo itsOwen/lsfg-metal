@@ -115,6 +115,14 @@ driver and the `nextDrawable` hook returns the original drawable. It is a transp
 
 ## Install
 
+The easy way is [Highball](https://github.com/gauthierpiarrette/highball), a free macOS launcher for
+Windows games. It ships this shim as part of its engine, so there is nothing here to build or place
+by hand: install a game, then turn frame generation on for it in the bottle's settings. You still
+need your own `lsfg-vk.dll` as described above, and Highball finds it in any bottle that has
+Lossless Scaling installed. Frame generation stays off until you ask for it.
+
+The rest of this section is the manual route, for another launcher or your own Wine setup.
+
 `Scripts/package.sh` produces the component layout:
 
 ```
