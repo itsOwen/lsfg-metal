@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "lsfg-metal"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "ash",
  "block2",
