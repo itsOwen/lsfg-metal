@@ -41,14 +41,14 @@ fn has_symbol(lib: &libloading::Library, name: &[u8]) -> bool {
     unsafe { lib.get::<*const ()>(name) }.is_ok()
 }
 
-// the shim exports 8 functions and vkCreateDevice is not one of them; the real driver has it
+// the shim exports the LSFGM_SHIM marker; a shim from before the marker is the one without vkCreateDevice
 fn is_shim(path: &Path) -> Result<bool, String> {
     let lib = unsafe { libloading::Library::new(path) }
         .map_err(|e| format!("cannot load {}: {e}", path.display()))?;
     if !has_symbol(&lib, b"vkGetInstanceProcAddr\0") {
         return Err(format!("{} has no vkGetInstanceProcAddr", path.display()));
     }
-    let shim = !has_symbol(&lib, b"vkCreateDevice\0");
+    let shim = has_symbol(&lib, b"LSFGM_SHIM\0") || !has_symbol(&lib, b"vkCreateDevice\0");
     // the initializer leaves a panic hook, and maybe a swizzle, pointing into this image
     std::mem::forget(lib);
     Ok(shim)

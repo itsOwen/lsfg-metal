@@ -43,6 +43,9 @@ fn main() {
     println!("cargo:rustc-env=LSFGM_VERSION={v}");
     // the shim stands in for the driver, so it carries the driver's install name (cdylib only; package.sh checks the export list)
     println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libMoltenVK.dylib");
+    // the forwarded driver helpers (src/shim/forward.rs) are asm, outside rustc's export list
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_mvk*");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_vk*");
     println!("cargo:rerun-if-env-changed=LSFGM_VERSION");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");

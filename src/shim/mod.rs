@@ -3,6 +3,7 @@ mod chain;
 mod chain_sizes;
 mod context;
 mod fixed;
+mod forward;
 mod proxy;
 mod sync;
 
@@ -139,8 +140,9 @@ fn shim_dir() -> Option<PathBuf> {
     }
 }
 
-fn load_driver() -> Option<Driver> {
-    let path = settings::os_env("LSFGM_MOLTENVK")
+// LSFGM_MOLTENVK, else libMoltenVK.real.dylib beside the shim; empty when neither is known
+fn driver_path() -> String {
+    settings::os_env("LSFGM_MOLTENVK")
         .filter(|p| !p.is_empty())
         .or_else(|| {
             shim_dir().map(|d| {
@@ -149,7 +151,11 @@ fn load_driver() -> Option<Driver> {
                     .into_owned()
             })
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn load_driver() -> Option<Driver> {
+    let path = driver_path();
     let fail = |e: &str| {
         error!("lsfg-metal shim: cannot load real MoltenVK from '{path}': {e}");
         None
@@ -702,6 +708,40 @@ pub unsafe extern "system" fn vkEnumerateInstanceVersion(version: *mut u32) -> v
             *version = vk::API_VERSION_1_0;
             vk::Result::SUCCESS
         }
+    }
+}
+
+// marks an image as this shim, for doctor and for the forwarders' search of loaded images
+#[no_mangle]
+pub static LSFGM_SHIM: u8 = 1;
+
+/// # Safety
+/// vulkan entry point; an instance the hook created is destroyed through it, any other by the driver
+#[no_mangle]
+pub unsafe extern "system" fn vkDestroyInstance(
+    instance: vk::Instance,
+    alloc: *const vk::AllocationCallbacks,
+) {
+    if MAPS.read().unwrap().instances.contains_key(&instance) {
+        return destroy_instance(instance, alloc);
+    }
+    if let Some(f) = forward::real::<vk::PFN_vkDestroyInstance>(c"vkDestroyInstance") {
+        f(instance, alloc);
+    }
+}
+
+/// # Safety
+/// vulkan entry point; a device the hook created is destroyed through it, any other by the driver
+#[no_mangle]
+pub unsafe extern "system" fn vkDestroyDevice(
+    device: vk::Device,
+    alloc: *const vk::AllocationCallbacks,
+) {
+    if device_of(device).is_some() {
+        return destroy_device(device, alloc);
+    }
+    if let Some(f) = forward::real::<vk::PFN_vkDestroyDevice>(c"vkDestroyDevice") {
+        f(device, alloc);
     }
 }
 

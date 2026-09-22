@@ -532,21 +532,37 @@ The script does not build, so the compiled-in version and `source.txt` agree onl
 `LSFGM_VERSION` is exported for both the `cargo build` and the packaging step. Left to their own
 git queries the two produce different strings from the same commit.
 
-Export check. The shim carries the driver's install name (`@rpath/libMoltenVK.dylib`) and must
-export exactly the eight functions a caller resolves by symbol:
+Export check. The shim carries the driver's install name (`@rpath/libMoltenVK.dylib`), so anything
+linked against MoltenVK binds to it, and `package.sh` fails unless the text exports are exactly its own
+entry points plus the forwarded driver functions listed in `src/shim/forward.rs`:
 
 ```sh
-nm -gU dist/renderers/lsfg/libMoltenVK.dylib | awk '$2=="T"' | wc -l   # must be 8
+nm -gU dist/renderers/lsfg/libMoltenVK.dylib | awk '$2=="T"' | wc -l   # 519: 10 + 509
 ```
 
-Wine `dlsym`s `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`, `vkCreateMetalSurfaceEXT` and
-`vkCreateMacOSSurfaceMVK`. A native app that loads the driver itself also takes the global entry
-points from it, so the shim exports `vkCreateInstance`, `vkEnumerateInstanceExtensionProperties`,
-`vkEnumerateInstanceVersion` and `vkEnumerateDeviceExtensionProperties`; without them such an app
-gives up on Vulkan (Cemu logs `vkEnumerateInstanceVersion not available`). Every other entry point
-is reachable only through the two `ProcAddr` functions. `objc2`'s class data statics are also exported, and that is expected: `rustc` owns the
-export list for a `cdylib` and adding a second `-exported_symbol` flag makes the linker refuse the
-link. They are data symbols, not text symbols, which is why the check filters on `T`.
+Ten are the shim's own. Wine `dlsym`s `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`,
+`vkCreateMetalSurfaceEXT` and `vkCreateMacOSSurfaceMVK`. A native app that loads the driver itself
+also takes the global entry points from it, so the shim exports `vkCreateInstance`,
+`vkEnumerateInstanceExtensionProperties`, `vkEnumerateInstanceVersion` and
+`vkEnumerateDeviceExtensionProperties`; without them such an app gives up on Vulkan (Cemu logs
+`vkEnumerateInstanceVersion not available`). `vkDestroyInstance` and `vkDestroyDevice` send an
+instance or device the hooks created back through them, and anything else to the driver.
+
+The rest are forwarders: every other C function any MoltenVK build exports, as a stub that looks the
+name up in the real driver on its first call and jumps there. Without them a library linked against
+MoltenVK fails to load; GStreamer's `applemedia` plugin, which decodes video, stops with
+`Symbol not found: _mvkMTLPixelFormatFromVkFormat`. A caller that binds a forwarded Vulkan function by
+symbol bypasses the hooks, exactly as it would with the driver alone; the hooks see what goes through
+the two `ProcAddr` functions and the shim's own exports. The `vk_icd*` loader entry points are never forwarded, since a loader prefers
+them over `vkGetInstanceProcAddr`. With no driver beside the shim (injected into a native game) a
+forwarder takes the name from the first loaded image that is not a copy of the shim. A name the driver
+lacks, or any name when the driver fails to load, aborts on its first call with a log line naming it. The list is the union of the MoltenVK builds
+in Highball, CrossOver, GStreamer, Cemu and Wine; regenerate it when a newer MoltenVK adds names.
+
+The forwarders are assembly, outside `rustc`'s export list for a `cdylib`, so `build.rs` adds the
+`_vk*` and `_mvk*` patterns with `-exported_symbol`. `objc2`'s class data statics and the
+`LSFGM_SHIM` marker are also exported; they are data symbols, not text symbols, which is why the
+check filters on `T`.
 
 `src/shim/chain_sizes.rs` is generated, not hand-written. It lists the `sType` and `sizeof` of every
 structure that can extend `VkDeviceCreateInfo` in the macOS header set (`vulkan_core.h`,
@@ -607,8 +623,8 @@ usage: doctor [--shim libMoltenVK.dylib] [--dll lsfg-vk.dll] [--app the-binary-t
 ```
 
 `--shim` is the installed `libMoltenVK.dylib`: doctor confirms it is the shim rather than a real
-MoltenVK an update put back (the shim exports eight functions and `vkCreateDevice` is not one of
-them), reports the version from `source.txt` beside it, and resolves the real driver, which is
+MoltenVK an update put back (the shim exports the `LSFGM_SHIM` marker; a shim older than the
+marker is the one without `vkCreateDevice`), reports the version from `source.txt` beside it, and resolves the real driver, which is
 `LSFGM_MOLTENVK` when set and otherwise `libMoltenVK.real.dylib` beside the shim, catching the
 missing file, the dangling symlink and the case where the real driver is the shim again. Without
 `--shim` it still checks the driver named by `LSFGM_MOLTENVK`. It then loads that driver, reports
