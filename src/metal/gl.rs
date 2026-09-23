@@ -1,6 +1,7 @@
 // opengl front end: frames from the game's buffer swap go through shared iosurfaces
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::mpsc::{channel, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 
 use ash::vk;
@@ -17,8 +18,9 @@ use objc2_metal::{
     MTLTextureDescriptor, MTLTextureUsage,
 };
 
-use super::generator::{image_info, import_texture, Backend, Wrapper, GPU_TIMEOUT};
-use super::{enabled, now, set_enabled, setup};
+use super::generator::{image_info, import_texture, native_off, Backend, Built, Native, Unshared, Wrapper, GPU_TIMEOUT};
+use super::{enabled, now, set_enabled, setup, Setup};
+use crate::generator::signature::Signature;
 use crate::log;
 use crate::pacer::{display_refresh, Estimator, Pacer, Sample};
 use crate::settings::PacingMode;
@@ -120,25 +122,36 @@ pub fn install() {
     set_enabled(true);
 }
 
-// one shared surface: an iosurface seen by opengl, metal and vulkan
+// one shared surface: an iosurface seen by opengl, metal and, on moltenvk, vulkan
 struct Surface {
     _surface: CFRetained<IOSurfaceRef>,
-    _texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
     gl_texture: u32,
     fbo: u32,
+    // null on the native generator
     image: vk::Image,
 }
 
-// per opengl context: index 0 holds the source frame, the rest the generated frames
-struct Context {
-    extent: (u32, u32),
-    surfaces: Vec<Surface>,
+// the generator behind one context: native metal, or the moltenvk context with its own sync
+enum Engine {
+    Native(Box<Native>),
+    Vulkan(Box<Vk>),
+}
+
+struct Vk {
     wrapper: Option<Wrapper>,
     cmd: Vec<vk::CommandBuffer>,
     gate: vk::Semaphore,
     mark: vk::Semaphore,
     mark_value: u64,
     fence: vk::Fence,
+}
+
+// per opengl context: index 0 holds the source frame, the rest the generated frames
+struct Context {
+    extent: (u32, u32),
+    surfaces: Vec<Surface>,
+    engine: Engine,
     pacer: Option<Pacer>,
     estimator: Estimator,
     // seconds the game spent in generated swaps during the previous frame
@@ -156,7 +169,11 @@ struct Stats {
 #[derive(Default)]
 struct Front {
     backend: Option<Backend>,
+    // set once the native generator is ruled out, by LSFGM_NATIVE=0 or a failed build
+    native_off: Option<bool>,
     contexts: HashMap<usize, Context>,
+    // native generators being built, per context, with the size they are for
+    pending: HashMap<usize, ((u32, u32), Built)>,
     // contexts that fell back to native swaps, including ones whose setup failed
     failed: HashSet<usize>,
 }
@@ -179,11 +196,13 @@ unsafe extern "C-unwind" fn flush_hook(this: *mut AnyObject, sel: Sel) {
     let entered = now();
     let mut guard = FRONT.lock().unwrap();
     let front = guard.get_or_insert_with(Front::default);
-    if let Err(e) = generate(front, cgl, extent, entered, || orig(this, sel)) {
+    // the game's gl thread may have no pool, and the native generator autoreleases its encoders
+    let made = objc2::rc::autoreleasepool(|_| generate(front, cgl, extent, entered, || orig(this, sel)));
+    if let Err(e) = made {
         log::error("OpenGL frame generation failed, presenting natively from now on:");
         log::error(&format!("- {e}"));
-        if let (Some(c), Some(b)) = (front.contexts.remove(&(cgl as usize)), &front.backend) {
-            c.destroy(b);
+        if let Some(c) = front.contexts.remove(&(cgl as usize)) {
+            c.destroy(front.backend.as_ref());
         }
         front.failed.insert(cgl as usize);
         orig(this, sel);
@@ -275,33 +294,27 @@ unsafe fn generate(
         present();
         return Ok(());
     }
-    if front.backend.is_none() {
-        // no metal layer here to take a gpu from, so the first device stands
-        front.backend = Some(Backend::create(s, None)?);
-    }
-    let b = front.backend.as_ref().unwrap();
     if front.contexts.get(&key).is_none_or(|c| c.extent != extent) {
         if let Some(old) = front.contexts.remove(&key) {
-            old.destroy(b);
+            old.destroy(front.backend.as_ref());
         }
+        if !Signature::new(p.performance_mode).fits(extent.0, extent.1, p.flow_for(extent.1)) {
+            present();
+            return Ok(());
+        }
+        let Some(c) = Context::build(front, s, cgl, extent)? else {
+            present();
+            return Ok(());
+        };
         let adaptive = p.pacing_mode == PacingMode::Adaptive;
-        let c = Context::new(
-            b,
-            cgl,
-            extent,
-            p.multiplier,
-            p.flow_for(extent.1),
-            p.performance_mode,
-            adaptive,
-        )?;
         let mode = if adaptive {
             "adaptive up to"
         } else {
             "multiplier"
         };
         log::info(&format!(
-            "OpenGL presentation {}x{}, {mode} {}",
-            extent.0, extent.1, p.multiplier
+            "OpenGL presentation {}x{}, {mode} {}, flow {:.2}",
+            extent.0, extent.1, p.multiplier, p.flow_for(extent.1)
         ));
         front.contexts.insert(key, c);
     }
@@ -324,37 +337,62 @@ unsafe fn generate(
     let saved = Saved::take();
     // the game's back buffer into the shared source surface; vulkan reads it only after gl is done
     blit(0, c.surfaces[0].fbo, extent);
-    // glfinish waits on the game's frame; a gl sync object would let vulkan start earlier
+    // glfinish waits on the game's frame; a gl sync object would let the generator start earlier
     glFinish();
-    let w = c.wrapper.as_mut().unwrap();
-    c.mark_value += 1;
-    w.dispatch(
-        b,
-        c.cmd[0],
-        c.surfaces[0].image,
-        (c.gate, 0),
-        inserted as u32,
-        (c.mark, c.mark_value),
-    )?;
-    if inserted == 0 {
-        // nothing waits on this iteration's copy, and the next swap writes the same surface
-        w.idle(b);
+    match &mut c.engine {
+        Engine::Native(n) => {
+            n.begin();
+            let cb = n.cb()?;
+            n.pipeline.copy_in(&cb, &c.surfaces[0].texture, n.iteration % 2)?;
+            n.pipeline.encode(&cb, false, n.iteration, n.timestamp)?;
+            n.commit(cb);
+            if inserted == 0 {
+                // the next swap writes the same surface
+                n.settle()?;
+            }
+        }
+        Engine::Vulkan(v) => {
+            let b = front.backend.as_ref().ok_or("backend missing")?;
+            let w = v.wrapper.as_mut().unwrap();
+            v.mark_value += 1;
+            w.dispatch(
+                b,
+                v.cmd[0],
+                c.surfaces[0].image,
+                (v.gate, 0),
+                inserted as u32,
+                (v.mark, v.mark_value),
+            )?;
+            if inserted == 0 {
+                // nothing waits on this iteration's copy, and the next swap writes the same surface
+                w.idle(b);
+            }
+        }
     }
-    let d = &b.device;
     let held_from = now();
     for (i, &ts) in slots.iter().take(inserted).enumerate() {
-        c.mark_value += 1;
-        w.acquire(
-            b,
-            c.cmd[1 + i],
-            c.surfaces[1 + i].image,
-            ts,
-            (c.mark, c.mark_value),
-            c.fence,
-        )?;
-        d.wait_for_fences(&[c.fence], true, GPU_TIMEOUT.as_nanos() as u64)
-            .map_err(|_| "OpenGL generated frame did not complete")?;
-        check(d.reset_fences(&[c.fence]), "vkResetFences")?;
+        match &mut c.engine {
+            Engine::Native(n) => {
+                n.produce(&c.surfaces[1 + i].texture, ts, None)?;
+                n.settle()?;
+            }
+            Engine::Vulkan(v) => {
+                let b = front.backend.as_ref().ok_or("backend missing")?;
+                let d = &b.device;
+                v.mark_value += 1;
+                v.wrapper.as_mut().unwrap().acquire(
+                    b,
+                    v.cmd[1 + i],
+                    c.surfaces[1 + i].image,
+                    ts,
+                    (v.mark, v.mark_value),
+                    v.fence,
+                )?;
+                d.wait_for_fences(&[v.fence], true, GPU_TIMEOUT.as_nanos() as u64)
+                    .map_err(|_| "OpenGL generated frame did not complete")?;
+                check(d.reset_fences(&[v.fence]), "vkResetFences")?;
+            }
+        }
         blit(c.surfaces[1 + i].fbo, 0, extent);
         if i + 1 == inserted && !show_original {
             drop(saved);
@@ -390,25 +428,81 @@ fn pace_debug(s: Sample, blocked: f64) {
 }
 
 impl Context {
-    unsafe fn new(
-        b: &Backend,
+    // native generator first; moltenvk when it is ruled out; none yet while the native one builds
+    unsafe fn build(
+        front: &mut Front,
+        s: &'static Setup,
         cgl: *mut c_void,
         extent: (u32, u32),
-        m: u32,
-        flow: f32,
-        perf: bool,
-        adaptive: bool,
-    ) -> Result<Context, String> {
-        let d = &b.device;
-        let mut c = Context {
-            extent,
-            surfaces: Vec::new(),
+    ) -> Result<Option<Context>, String> {
+        // only a native generator that cannot be built turns it off; a surface error fails this context alone
+        if !*front.native_off.get_or_insert_with(native_off) {
+            let key = cgl as usize;
+            // built on its own thread, so the game's swaps never wait on it
+            match front.pending.get(&key).filter(|(e, _)| *e == extent).map(|(_, rx)| rx.try_recv()) {
+                Some(Err(TryRecvError::Empty)) => return Ok(None),
+                Some(Ok(Ok(n))) => {
+                    front.pending.remove(&key);
+                    return Context::new(None, Engine::Native(Box::new(n.get())), s, cgl, extent).map(Some);
+                }
+                Some(result) => {
+                    front.pending.remove(&key);
+                    let e = match result {
+                        Ok(Err(e)) => e,
+                        _ => "the build thread ended".into(),
+                    };
+                    log::warn(&format!("Native Metal generator unavailable ({e}); using MoltenVK"));
+                    front.native_off = Some(true);
+                }
+                None => {
+                    let (tx, rx) = channel();
+                    std::thread::Builder::new()
+                        .name("lsfg-metal native build".into())
+                        .spawn(move || {
+                            let built = objc2::rc::autoreleasepool(|_| {
+                                MTLCreateSystemDefaultDevice()
+                                    .ok_or_else(|| "no Metal device for the OpenGL context".to_string())
+                                    .and_then(|d| Native::new(&d, s, extent, false))
+                            });
+                            let _ = tx.send(built.map(Unshared));
+                        })
+                        .map_err(|e| format!("no thread for the native build: {e}"))?;
+                    front.pending.insert(key, (extent, rx));
+                    return Ok(None);
+                }
+            }
+        }
+        if front.backend.is_none() {
+            // no metal layer here to take a gpu from, so the first device stands
+            front.backend = Some(Backend::create(s, None)?);
+        }
+        let b = front.backend.as_ref().ok_or("backend missing")?;
+        let engine = Engine::Vulkan(Box::new(Vk {
             wrapper: None,
             cmd: Vec::new(),
-            gate: vkutil::create_semaphore(d, true)?,
+            gate: vkutil::create_semaphore(&b.device, true)?,
             mark: vk::Semaphore::null(),
             mark_value: 0,
             fence: vk::Fence::null(),
+        }));
+        Context::new(Some(b), engine, s, cgl, extent).map(Some)
+    }
+
+    // on moltenvk with a backend, natively without one
+    unsafe fn new(
+        b: Option<&Backend>,
+        engine: Engine,
+        s: &'static Setup,
+        cgl: *mut c_void,
+        extent: (u32, u32),
+    ) -> Result<Context, String> {
+        let p = &s.profile;
+        let m = p.multiplier;
+        let adaptive = p.pacing_mode == PacingMode::Adaptive;
+        let mut c = Context {
+            extent,
+            surfaces: Vec::new(),
+            engine,
             pacer: adaptive
                 .then(|| Pacer::new(objc2::rc::autoreleasepool(|_| display_refresh()), m)),
             estimator: Estimator::default(),
@@ -416,8 +510,10 @@ impl Context {
             stats: Stats::default(),
         };
         let built = (|| {
-            c.mark = vkutil::create_semaphore(d, true)?;
-            c.fence = vkutil::create_fence(d)?;
+            if let (Engine::Vulkan(v), Some(b)) = (&mut c.engine, b) {
+                v.mark = vkutil::create_semaphore(&b.device, true)?;
+                v.fence = vkutil::create_fence(&b.device)?;
+            }
             let mut prior = 0i32;
             glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &mut prior);
             let made = (0..=m).try_for_each(|_| {
@@ -426,10 +522,12 @@ impl Context {
             });
             glBindTexture(GL_TEXTURE_RECTANGLE, prior as u32);
             made?;
-            for _ in 0..=m {
-                c.cmd.push(vkutil::allocate_command_buffer(d, b.pool)?);
+            if let (Engine::Vulkan(v), Some(b)) = (&mut c.engine, b) {
+                for _ in 0..=m {
+                    v.cmd.push(vkutil::allocate_command_buffer(&b.device, b.pool)?);
+                }
+                v.wrapper = Some(Wrapper::new(b, extent, p.flow_for(extent.1), p.performance_mode, false)?);
             }
-            c.wrapper = Some(Wrapper::new(b, extent, flow, perf, false)?);
             Ok::<_, String>(())
         })();
         match built {
@@ -462,29 +560,42 @@ impl Context {
         ));
     }
 
-    fn destroy(mut self, b: &Backend) {
-        let d = &b.device;
-        if let Some(w) = self.wrapper.take() {
-            w.destroy(b);
+    // the backend is none only for a native context
+    fn destroy(mut self, b: Option<&Backend>) {
+        match (&mut self.engine, b) {
+            (Engine::Native(n), _) => {
+                let _ = n.settle();
+            }
+            (Engine::Vulkan(v), Some(b)) => {
+                let d = &b.device;
+                if let Some(w) = v.wrapper.take() {
+                    w.destroy(b);
+                }
+                unsafe {
+                    for s in &self.surfaces {
+                        d.destroy_image(s.image, None);
+                    }
+                    if !v.cmd.is_empty() {
+                        d.free_command_buffers(b.pool, &v.cmd);
+                    }
+                    d.destroy_semaphore(v.gate, None);
+                    d.destroy_semaphore(v.mark, None);
+                    d.destroy_fence(v.fence, None);
+                }
+            }
+            (Engine::Vulkan(_), None) => {}
         }
         unsafe {
             for s in self.surfaces.drain(..) {
-                d.destroy_image(s.image, None);
                 glDeleteFramebuffers(1, &s.fbo);
                 glDeleteTextures(1, &s.gl_texture);
             }
-            if !self.cmd.is_empty() {
-                d.free_command_buffers(b.pool, &self.cmd);
-            }
-            d.destroy_semaphore(self.gate, None);
-            d.destroy_semaphore(self.mark, None);
-            d.destroy_fence(self.fence, None);
         }
     }
 }
 
 impl Surface {
-    unsafe fn new(b: &Backend, cgl: *mut c_void, (w, h): (u32, u32)) -> Result<Surface, String> {
+    unsafe fn new(b: Option<&Backend>, cgl: *mut c_void, (w, h): (u32, u32)) -> Result<Surface, String> {
         let keys = [
             kIOSurfaceWidth,
             kIOSurfaceHeight,
@@ -550,7 +661,7 @@ impl Surface {
             Err(format!(
                 "IOSurface framebuffer unusable (CGL {err}, status {status:#x})"
             ))
-        } else {
+        } else if let Some(b) = b {
             import_texture(
                 &b.device,
                 &texture,
@@ -560,11 +671,13 @@ impl Surface {
                     vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
                 ),
             )
+        } else {
+            Ok(vk::Image::null())
         };
         match image {
             Ok(image) => Ok(Surface {
                 _surface: surface,
-                _texture: texture,
+                texture,
                 gl_texture,
                 fbo,
                 image,
