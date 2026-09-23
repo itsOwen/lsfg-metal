@@ -215,7 +215,11 @@ impl Generator {
             let rx = self.rx.lock().unwrap().take().unwrap();
             let spawned = std::thread::Builder::new()
                 .name("lsfg-metal".into())
-                .spawn(move || autoreleasepool(|_| Worker::new(self)).run(rx));
+                .spawn(move || {
+                    // presents are on the display's deadline: user-interactive qos keeps the worker off the efficiency cores
+                    unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+                    autoreleasepool(|_| Worker::new(self)).run(rx)
+                });
             if let Err(e) = spawned {
                 log::error(&format!("cannot start the Metal presentation worker: {e}"));
                 set_enabled(false);
@@ -352,6 +356,7 @@ struct DlInfo {
 }
 extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+    fn pthread_set_qos_class_self_np(qos: u32, relative: c_int) -> c_int;
 }
 
 // LSFGM_GENERATOR_MOLTENVK, else LSFGM_MOLTENVK, else libMoltenVK.real.dylib beside this library
