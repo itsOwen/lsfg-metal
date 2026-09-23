@@ -5,7 +5,7 @@ plus a Metal front end, independent Rust implementation, MIT.
 
 **This is a very early release.** It does what it claims: 2x, 3x and 4x hold their exact cadence
 with no dropped or duplicated frames, on the Vulkan path and the Metal path, verified in real games
-through Steam. It has also only ever run on one Apple Silicon Mac, a handful of titles and a single
+through Steam. It has also only ever run on one Apple silicon Mac, a handful of titles and a single
 60 Hz display. Everything outside that is untested, so expect rough edges on hardware, games and
 refresh rates it has never seen. A bug report with a log attached is worth more than a star.
 
@@ -80,16 +80,52 @@ The Metal front end is the same dylib, injected with `DYLD_INSERT_LIBRARIES` and
 `LSFGM_METAL=1`. It swizzles `-[CAMetalLayer nextDrawable]` so the game receives private drawables
 owned by the shim, and swizzles the driver's command buffer class for `presentDrawable:`,
 `presentDrawable:afterMinimumDuration:`, `presentDrawable:atTime:` and `commit`. `commit` hands the
-frame to a per-layer worker thread, which runs the pipeline on a private Vulkan device and presents
-the layer's real drawables.
+frame to a per-layer worker thread, which runs the pipeline (natively on the layer's own Metal
+device, or on a private Vulkan device when it generates on MoltenVK) and presents the layer's real
+drawables. A frame drawn before a resize, whose size no longer matches the layer, is shown as it is,
+and the pipeline is rebuilt once the first frame of the new size arrives.
 
 The OpenGL front end rides on the same injection. It is armed with `LSFGM_METAL=1` alongside the
 Metal hooks, or alone with `LSFGM_OPENGL=1`, which leaves `CAMetalLayer` untouched for processes
 whose layers belong to a Vulkan driver. It swizzles `-[NSOpenGLContext flushBuffer]`, blits the
-back buffer into an `IOSurface` shared with the private Vulkan device, and blits each generated
-frame back into the back buffer before calling the original swap. The game's framebuffer bindings,
-read buffer, scissor and sRGB state are restored before it continues. Adaptive pacing works here
-too; the time spent in generated swaps is fed back to the estimator.
+back buffer into an `IOSurface` shared with the generator, and blits each generated frame back into
+the back buffer before calling the original swap. The game's framebuffer bindings, read buffer,
+scissor and sRGB state are restored before it continues. Adaptive pacing works here too; the time
+spent in generated swaps is fed back to the estimator.
+
+On an Apple silicon GPU the Metal front end, the Vulkan proxy swapchain and the OpenGL front end
+generate natively on Metal. When a context is built, for a new size or format, the shim translates
+the DLL's SPIR-V shaders to Metal Shading Language 2.3 with SPIRV-Cross, which is linked in, and
+compiles them with the system's Metal compiler; the translation is kept for later builds and Metal's
+own shader cache keeps the compiled result. The build runs on its own thread, so the game never
+waits on it: its frames are shown as they are, without generated frames, until the build is done.
+The first build took about 1.2 seconds at the first launch of a test app; on MoltenVK the game
+waited about 9.6 seconds for it. Each pass is recorded on one
+concurrent compute encoder, with a texture barrier between stages. The output is bit-identical to
+the same pipeline on MoltenVK: every byte of every generated frame matched in `validate --in` at 2x,
+3x and 4x, flow 1.0, 0.75 and 0.5, quality and performance, fp16 and fp32. On an M2 it needs 18 to
+36% less time per generated frame in `validate`:
+
+| `validate`, ms per generated frame | MoltenVK | native |
+|---|---|---|
+| 1920x1080, quality | 10.53 | 7.81 |
+| 1920x1080, performance | 5.54 | 4.10 |
+| 1920x1080, quality, flow 0.5 | 4.90 | 3.15 |
+| 2560x1440, quality | 16.09 | 13.14 |
+| 2560x1664, quality | 18.47 | 15.14 |
+| 2940x1846, quality, flow 0.59 (`auto`) | 10.98 | 8.52 |
+
+That time goes back to the game when the GPU is the limit: the native Valheim at 2940x1846, 2x, flow
+1.0 ran at 28.3 to 28.5 source fps with 13 to 15 late frames per 240 on MoltenVK, and at a steady 30
+with none natively. A game already at the display-locked rate keeps the same frame rate, latency and
+pacing (Codename CURE II on DXMT and DXVK). If the native generator cannot be built, for example
+because a shader does not translate or the GPU is not Apple silicon, the shim logs
+`Native Metal generator unavailable (<why>); using MoltenVK` and generates on MoltenVK instead; `LSFGM_NATIVE=0` asks for that directly. Intel and AMD GPUs therefore always generate on
+MoltenVK, and neither generator has been tested on one. The Vulkan fixed present path generates
+inside the game's own Vulkan device and always stays on MoltenVK.
+
+Frames whose width or height after flow scaling is under 64 pixels are shown without generated
+frames on every path, because the coarsest level of the flow pyramid would be empty.
 
 With no matching profile, all hooks stay out of the way: the shim forwards every call to the real
 driver and the `nextDrawable` hook returns the original drawable. It is a transparent passthrough.
@@ -97,18 +133,21 @@ driver and the `nextDrawable` hook returns the original drawable. It is a transp
 ## Requirements
 
 * x86_64 Wine running under Rosetta. The shim, your Wine build's MoltenVK and the game are all x86_64.
-  Native Apple Silicon games use an arm64 build of the shim instead; see
+  Native Apple silicon games use an arm64 build of the shim instead; see
   [Native macOS games](#native-macos-games).
-* A MoltenVK that exposes `VK_EXT_metal_objects`. The Metal front end and the proxy swapchain
-  import Metal textures and shared events through it. MoltenVK 1.4.2 or newer is recommended:
+* For Vulkan games, a MoltenVK that exposes `VK_EXT_metal_objects`: the proxy swapchain hands the
+  game Metal textures through it. MoltenVK 1.4.2 or newer is recommended:
   [1.4.2 fixes imported-texture residency and device loss with argument buffers](https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/Docs/Whats_New.md).
   That driver release requires macOS 12 or newer.
-* MoltenVK 1.3 or newer for frame generation itself. MoltenVK 1.2.x compiles the shaders but writes
-  black generated frames, so the shim refuses it, logs `MoltenVK <version> is too old for frame
-  generation`, and the game presents natively. The Metal front end and the Vulkan proxy generate on
-  the shim's own Vulkan device, so `LSFGM_GENERATOR_MOLTENVK` can point them at a newer MoltenVK
-  than the one the game uses.
-* macOS 11 or newer (the deployment target of this crate).
+* MoltenVK 1.3 or newer only where generation runs on MoltenVK: the Vulkan fixed present path,
+  `LSFGM_NATIVE=0`, a GPU that is not Apple silicon, or the fallback when the native generator
+  cannot be built. MoltenVK 1.2.x compiles the shaders but writes black generated frames, so the
+  shim refuses it, logs `MoltenVK <version> is too old for frame generation`, and the game presents
+  natively. When the Metal and OpenGL front ends or the proxy generate on MoltenVK,
+  `LSFGM_GENERATOR_MOLTENVK` points them at a newer MoltenVK than the one the game uses; the fixed
+  present path always uses the game's own driver.
+* macOS 11 or newer (the deployment target of this crate; the native generator emits Metal Shading
+  Language 2.3, which macOS 11 supports). Only macOS 27 on an M2 has been tested.
 * Your own `lsfg-vk.dll` from the *Lossless Scaling* Steam application, which you can buy at
   <https://store.steampowered.com/app/993090/>. Select the **`lsfg-vk` beta branch** under
   Properties, Betas: the default branch ships only `Lossless.dll`, whose shaders are DirectX
@@ -132,6 +171,7 @@ dist/renderers/lsfg/
   libMoltenVK.dylib          the shim
   libMoltenVK.real.dylib ->  ../../frameworks/libMoltenVK.dylib
   LICENSE
+  THIRD_PARTY.txt            notices for SPIRV-Cross and the Rust crates linked in (std included)
   source.txt                 version, license, source URL
 ```
 
@@ -169,17 +209,24 @@ than `libMoltenVK.dylib`.
 ### CrossOver
 
 CrossOver removes `DYLD_*` variables before it starts Wine, so the shim has to replace CrossOver's own
-MoltenVK. CrossOver 26 ships MoltenVK 1.2.10, which is too old for frame generation, so the
-generator also needs a newer MoltenVK of its own. Tested with CrossOver 26.3 on D3DMetal, DXMT, DXVK,
-WineD3D and an OpenGL game.
+MoltenVK. CrossOver 26 ships MoltenVK 1.2.10, which is too old for generation on MoltenVK, but the
+native generator does not need a newer one: in CrossOver 26.3, D3DMetal 4 (Game Porting Toolkit 4.0b2)
+generated natively with only CrossOver's own MoltenVK, 30 source fps shown at 60 with no late
+frames. That is the only CrossOver renderer tested on the native generator. D3DMetal, DXMT, DXVK,
+WineD3D and an OpenGL game were tested in CrossOver 26.3 earlier, with generation on a newer
+MoltenVK (step 2); DXMT, DXVK, WineD3D and OpenGL have not been tested there on the native
+generator.
 
 1. Quit CrossOver. In `CrossOver.app/Contents/SharedSupport/CrossOver/lib64/`, rename
    `libMoltenVK.dylib` to `libMoltenVK.real.dylib` and copy the shim in as `libMoltenVK.dylib`.
    macOS only allows this from an app with App Management permission (System Settings, Privacy &
    Security), and a CrossOver update undoes it.
-2. Get MoltenVK 1.3 or newer, for example `MoltenVK-macos.tar` from the
-   [official releases](https://github.com/KhronosGroup/MoltenVK/releases), whose
-   `MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` contains x86_64. Keep it outside the app.
+2. Optional, only for generation on MoltenVK (`LSFGM_NATIVE=0`, a GPU that is not Apple silicon, or
+   the fallback when the native generator cannot be built): get MoltenVK 1.3 or newer, for example
+   `MoltenVK-macos.tar` from the [official releases](https://github.com/KhronosGroup/MoltenVK/releases),
+   whose `MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` contains x86_64. Keep it outside
+   the app and add `"LSFGM_GENERATOR_MOLTENVK" = "/path/to/newer/libMoltenVK.dylib"` to the
+   variables below.
 3. Add the variables to the bottle's `cxbottle.conf` under `[EnvironmentVariables]`:
 
 ```ini
@@ -187,34 +234,44 @@ WineD3D and an OpenGL game.
 "LSFGM_MULTIPLIER" = "2"
 "LSFGM_METAL" = "1"
 "LSFGM_DLL_PATH" = "/path/to/Lossless Scaling/lsfg-vk.dll"
-"LSFGM_GENERATOR_MOLTENVK" = "/path/to/newer/libMoltenVK.dylib"
 ```
 
 Use `LSFGM_GENERATOR_MOLTENVK`, not `LSFGM_MOLTENVK`, for the newer driver: CrossOver's DXVK and
 WineD3D only start on CrossOver's own MoltenVK, and `LSFGM_MOLTENVK` would change the driver the
 game uses as well.
 
+The Vulkan fixed present path always generates on the game's own driver, which here is CrossOver's
+MoltenVK 1.2.10, so a Vulkan swapchain that lands on it (HDR10 or float sRGB,
+`LSFGM_VULKAN_PROXY=0`, or a proxy swapchain that could not be created) logs
+`Frame generation disabled; using passthrough` and presents without generated frames. A newer
+MoltenVK from step 2 does not change that.
+
 ### Native macOS games
 
-A native Apple Silicon game that draws with Metal can use the Metal front end directly, from an
+A native Apple silicon game that draws with Metal can use the Metal front end directly, from an
 arm64 build of the shim: download `lsfg-v<version>-arm64.tar.xz` from the
 [releases](https://github.com/itsOwen/lsfg-metal/releases), or build it with
 `cargo build --release --target aarch64-apple-darwin`. Tested with the native Valheim (Unity) at
-2x: about 28 source fps shown at about 56, with a frame dump confirming the generated frames, and
-with Cemu (Wii U) on its Metal backend at 2x: Breath of the Wild capped at 30 fps shown at about 60.
+2x, 2940x1846, flow 1.0: on the native generator a steady 30 source fps shown at 60 with no late
+frames per 240, where generation on MoltenVK managed 28.3 to 28.5. Cemu (Wii U) on its Metal backend
+was tested at 2x with generation on MoltenVK only: Breath of the Wild capped at 30 fps shown at
+about 60. It has not been measured on the native generator.
 
 ```sh
 cd "/path/to/steamapps/common/Valheim"
 DYLD_INSERT_LIBRARIES=/path/to/lsfg-metal/liblsfg_metal.dylib \
 LSFGM_METAL=1 LSFGM_ENV=1 LSFGM_MULTIPLIER=2 \
 LSFGM_DLL_PATH="/path/to/Lossless Scaling/lsfg-vk.dll" \
-LSFGM_GENERATOR_MOLTENVK=/path/to/MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib \
 ./valheim.app/Contents/MacOS/Valheim
 ```
 
-`LSFGM_GENERATOR_MOLTENVK` needs an arm64 MoltenVK 1.3 or newer; the official `MoltenVK-macos.tar`
-is universal. A Steam game also needs the Steam client running. The game's code signature must
-allow injected libraries: `codesign -d --entitlements - <game>.app` has to list
+The native generator does not load MoltenVK. Generation on MoltenVK (`LSFGM_NATIVE=0`, or the
+fallback when the native generator cannot be built) needs an arm64 MoltenVK 1.3 or newer, named by
+`LSFGM_GENERATOR_MOLTENVK`; the official `MoltenVK-macos.tar` is universal. Whether a native game
+runs with no MoltenVK on the system at all has not been tested.
+
+A Steam game also needs the Steam client running. The game's code signature must allow injected
+libraries: `codesign -d --entitlements - <game>.app` has to list
 `com.apple.security.cs.allow-dyld-environment-variables` and
 `com.apple.security.cs.disable-library-validation`, or the app must not use the hardened runtime.
 Valheim's signature allows it; many games do not, and those cannot use frame generation this way.
@@ -239,16 +296,17 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_LOG_LEVEL` | log level | `debug`, `info`, `warning`, `error` | `info` |
 | `LSFGM_LOG_FILE` | append logs to this file as well as stderr | path | unset |
 | `LSFGM_MOLTENVK` | real driver path | path to the real MoltenVK, any leaf name but `libMoltenVK.dylib` | `libMoltenVK.real.dylib` beside the shim |
-| `LSFGM_GENERATOR_MOLTENVK` | MoltenVK for the shim's own generation device only; the game keeps the real driver | path to a MoltenVK, 1.3 or newer | unset, the real driver |
+| `LSFGM_GENERATOR_MOLTENVK` | MoltenVK for the shim's own generation device when the Metal and OpenGL front ends or the Vulkan proxy generate on MoltenVK; the game keeps the real driver, and the fixed present path always uses the game's own driver | path to a MoltenVK, 1.3 or newer | unset, the real driver |
 | `LSFGM_METAL` | enable the Metal front end, OpenGL included | enabled when set, non-empty and not `0` | unset |
 | `LSFGM_OPENGL` | enable only the OpenGL front end; ignored when `LSFGM_METAL` is on | enabled when set, non-empty and not `0` | unset |
 | `LSFGM_VULKAN_PROXY` | proxy swapchain on the Vulkan path, generating on the shim's own device | `0` disables it and forces the fixed present path | unset, proxy used when supported |
-| `LSFGM_TARGET_FPS` | override the display refresh used by the pacer | finite positive float, whole string | unset, the main screen's rate |
+| `LSFGM_NATIVE` | generate on MoltenVK instead of natively on Metal (Metal and OpenGL front ends, Vulkan proxy; the fixed present path always uses MoltenVK) | `0` selects MoltenVK, any other value is ignored | unset, native |
+| `LSFGM_TARGET_FPS` | override the display refresh used by the pacer | float from 1 to 1000, whole string | unset, the main screen's rate |
 | `LSFGM_STATS` | periodic statistics lines | read by **presence** | unset |
 | `LSFGM_LATENCY` | Metal presentation latency, p50/p95 every 120 callbacks per frame kind, and on-screen intervals (p50, p95, stdev, frames held past 1.5 intervals) every 240 presents | read by **presence** | unset |
 | `LSFGM_PACE_DEBUG` | per-frame estimator log line | read by **presence** | unset |
 | `LSFGM_METAL_DUMP` | frame dump directory (Metal path) | directory path | unset |
-| `LSFGM_GPU_PROFILE` | GPU timestamps around every generator stage, printed by `validate` | read by **presence** | unset |
+| `LSFGM_GPU_PROFILE` | GPU timestamps around every stage of the MoltenVK generator, printed by `validate` | read by **presence** | unset |
 | `LSFGM_CONFIG` | configuration file path, used verbatim and highest precedence | path; must exist or loading fails | unset |
 | `LSFGM_PROFILE` | select a profile by exact name | profile name | unset |
 | `LSFGM_DISABLE` | turn the shim off for this process: no profile, no swizzles, every path passes through | read by **presence**, any value including empty | unset |
@@ -256,23 +314,26 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.7.1` |
 
 Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_DISABLE`,
-`DISABLE_LSFGM`, `LSFGM_STATS`, `LSFGM_PACE_DEBUG` and `LSFGM_LATENCY`. Every other variable is read by value and is only
-honoured when non-empty.
+`DISABLE_LSFGM`, `LSFGM_STATS`, `LSFGM_PACE_DEBUG`, `LSFGM_LATENCY` and `LSFGM_GPU_PROFILE`. Every
+other variable is read by value and is only honoured when non-empty.
 
 The boolean variables do not share one truth rule: the profile flags are true only for `1`,
-`LSFGM_NO_FP16` disables fp16 only for `1`, and `LSFGM_METAL`, `LSFGM_OPENGL` and
-`LSFGM_VULKAN_PROXY` are on for anything but `0`. `LSFGM_PERFORMANCE_MODE=true` therefore means
-false.
+`LSFGM_NO_FP16` disables fp16 only for `1`, `LSFGM_NATIVE` acts only on `0`, and `LSFGM_METAL`,
+`LSFGM_OPENGL` and `LSFGM_VULKAN_PROXY` are on for anything but `0`. `LSFGM_PERFORMANCE_MODE=true`
+therefore means false.
 
-In file mode only `LSFGM_DLL_PATH`, `LSFGM_NO_FP16`, `LSFGM_LOG_LEVEL` and `LSFGM_LOG_FILE` are read;
-they override the file's `[global]` values, also after a reload. The profile variables
-(`LSFGM_MULTIPLIER` through `LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT`) are ignored without `LSFGM_ENV`.
-`~` is not expanded in any environment variable; only the file's `dll` and `log_file` get that.
+Of the settings variables, file mode reads only `LSFGM_DLL_PATH`, `LSFGM_NO_FP16`,
+`LSFGM_LOG_LEVEL` and `LSFGM_LOG_FILE`; they override the file's `[global]` values, also after a
+reload. The profile variables (`LSFGM_MULTIPLIER` through `LSFGM_LOW_LATENCY`) are ignored without
+`LSFGM_ENV`. `~` is not expanded in any environment variable; only the file's `dll` and `log_file`
+get that.
 
 Also consulted: `XDG_CONFIG_HOME` and `HOME` for the config path; `SteamAppId` and the process's
-own command line for profile selection; `HOME` and `WINEPREFIX` for DLL discovery; `HOME` and `XDG_CACHE_HOME` for the pipeline
-cache directory (`$XDG_CACHE_HOME/lsfg-metal`, else `~/Library/Caches/lsfg-metal`, files
-`cache_{quality|performance}_<driver uuid>.bin`).
+own command line for profile selection; `HOME` and `WINEPREFIX` for DLL discovery; `HOME` and
+`XDG_CACHE_HOME` for the pipeline cache that generation on MoltenVK keeps
+(`$XDG_CACHE_HOME/lsfg-metal`, else `~/Library/Caches/lsfg-metal`, files
+`cache_{quality|performance}_<driver uuid>.bin`). The native generator relies on Metal's own shader
+cache instead.
 
 There is no `LSFGM_HDR`. HDR is decided by the swapchain or layer format and color space, not by a
 variable.
@@ -323,13 +384,13 @@ flow_scale = 1.0
 performance_mode = false
 override_present_mode = true
 preserve_swapchain_image_count = false
-low_latency = false
 ```
 
-`dll` and `log_file` appear in `[global]` only when set (`~` is expanded on read); `active_in` is a
+`dll` and `log_file` appear in `[global]` only when set (`~` is expanded on read), and
+`low_latency = true` only when on, so a file written by this version still loads in an older one; `active_in` is a
 string for one entry, an array for several, and omitted for none. `pacing` is accepted as an alias for
 `pacing_mode`, a `# comment` after any value is accepted, and a key that appears twice takes the
-last value.
+last value, also for `flow_scale` when one of the two is `"auto"`.
 
 Supported subset of TOML:
 
@@ -343,7 +404,7 @@ Supported subset of TOML:
 * `version` must be the integer `2`; `[global]` must be present; `[[profile]]` is an array of
   tables. Unknown keys are errors (`Unknown key in configuration: <key>`,
   `Unknown key in [global] section: <key>`, `Unknown key in profile section: <key>`).
-* A profile's `multiplier` must be 1 to 4 (above 4 is `Profile multipliers must be 1 to 4`, below 1
+* A profile's `multiplier` must be 1 to 4 (above 4 is `Profile '<name>' has multiplier > 4`, below 1
   is `Profile '<name>' has multiplier < 1`) and its `flow_scale` 0.25 to 1.0 or `"auto"`. Multiplier
   1 is accepted here and disables generation; environment mode is stricter and requires 2 to 4.
 
@@ -356,16 +417,19 @@ watcher is not created when `LSFGM_ENV` is set. Only `flow_scale` and `performan
 into the pipeline, so only those two rebuild it on reload; a new `multiplier` is re-read on the next
 present and costs nothing beyond the extra inner passes it allocates. `override_present_mode` and
 `preserve_swapchain_image_count` are properties of the swapchain itself and are captured when it is
-created, so changing them takes effect only when the game recreates it. Only the Vulkan fixed present path checks the
-watcher: the Metal front end and the Vulkan proxy path capture the profile once when they are set
-up, so a config change does not reach them until the swapchain or layer is rebuilt.
+created, so changing them takes effect only when the game recreates it. A changed `log_file` is
+opened on reload. Only the Vulkan fixed
+present path checks the watcher: the Metal front end, the Vulkan proxy path and the OpenGL front end
+capture the profile once when they are set up, so a config change does not reach them until the
+swapchain or layer is rebuilt.
 
 `flow_scale = "auto"` picks 1080 divided by the source height, clamped to 0.25 to 1.0: 1.0 at 1080p,
 0.75 at 1440p, 0.5 at 2160p, which is the scale Lossless Scaling itself recommends for each. Every
 pass except the final full-resolution one runs at the flow resolution, so it sets most of the GPU
 cost. On an M2 at 2940x1846 (a Retina panel at native resolution) one generated frame in quality
-mode costs 23.4 ms at 1.0, 12.4 ms at 0.62 and 9.3 ms at 0.5; auto picks 0.59 there. It is chosen
-again whenever the context is rebuilt for a new size.
+mode costs, on the MoltenVK generator, 23.4 ms at 1.0, 12.4 ms at 0.62 and 9.3 ms at 0.5; auto picks
+0.59 there, which takes 8.5 ms on the native generator. It is chosen again whenever the context is
+rebuilt for a new size.
 
 `low_latency` (Metal path and Vulkan proxy swapchain, fixed pacing, off by default). A game and a
 display that run at the same rate never drain a frame that got stuck in the present queue, and a
@@ -377,13 +441,14 @@ source runs at that rate. Skips wait 60 source frames after any change of the dr
 skip that does not shorten the latency is retried once, 60 windows of 30 originals later (a minute
 at 30 fps), and then never again for that layer. A game that waits on two drawables for longer than
 four display-locked intervals, for example one that acquires twice before it presents, gets the
-third back for good. On an M2 Air at 60 Hz this took commit-to-display of original frames from 99.5
-to 66.2 ms in Codename CURE II with DXMT and from 98.9 to 65.6 ms with DXVK (2x), from 149 to 99 ms
-uncapped at 3x, and from 99 to 65.6 ms in the `mtlclear` smoke test at 30 fps. The cost is power
-when the GPU is near its limit: with less work queued it runs at higher clocks for shorter bursts,
-and in the same Codename scene with DXMT GPU power rose from 1.8 to 4.7 W (with DXVK it did not
-rise, 2.5 to 2.3 W). Turn it on when latency matters more than battery and heat. Adaptive pacing is
-unaffected.
+third back for good. On an M2 Air at 60 Hz, on the MoltenVK generator, this took commit-to-display
+of original frames from 99.5 to 66.2 ms in Codename CURE II with DXMT and from 98.9 to 65.6 ms with
+DXVK (2x), from 149 to 99 ms uncapped at 3x (99 ms again on the native generator), and from 99 to
+65.6 ms in the `mtlclear` smoke test at 30 fps. The cost is power when the GPU is near its limit:
+with less work queued it runs at higher clocks for shorter bursts.
+In the same Codename scene with DXMT the GPU did the same work at 1110 to 1236 MHz instead of 612 to
+808 MHz, and its power rose from about 3.5 to about 5.1 W (with DXVK it did not rise, 2.5 to 2.3 W).
+Turn it on when latency matters more than battery and heat. Adaptive pacing is unaffected.
 
 Profile selection order:
 
@@ -419,27 +484,31 @@ A **sample** per source frame is `{interval, trusted}`. `interval` is the time s
 present. `trusted` is `blocked < max(0.001 s, interval * 0.1)`, where `blocked` is the time the
 game's thread spent waiting inside the shim's hooks (for a drawable or a proxy image). A frame that
 waited was ahead of presentation, so its interval measures the display's cadence rather than the
-game's and is not trusted. The first sample is never trusted.
+game's and is not trusted. The first sample is never trusted. A frame that is *behind* counts as
+trusted whatever it waited: its interval is longer than `n + 0.5` refresh intervals, where `n` is
+the largest slot count of the last four frames, so the display ran out of queued frames before it
+arrived.
 
 Slots are fitted against the display refresh interval:
 
 * An unknown or hitching interval (non-finite, zero or negative, or longer than
-  `refresh * cap * 4`) returns a single slot `[1]` and does not disturb the estimate.
+  `max(0.2 s, refresh * cap * 4)`) returns a single slot `[1]` and does not disturb the estimate.
 * Trusted samples smooth the estimate with factor 0.2; untrusted ones feed a separate cadence mean
   and can replace the estimate after 10 consecutive untrusted frames if that cadence is faster.
-* After 60 consecutive untrusted samples every frame probes with one slot until a trusted sample
-  arrives, and that trusted sample replaces the estimate outright, without smoothing.
-* If `estimate / refresh` is within 0.1 of a whole number, or rounds to at least the cap, the pacer locks
-  to that many evenly spaced slots (`1/n .. n/n`). A game at or above the refresh rate gets `[1]`
-  and is left alone.
+* After 60 consecutive untrusted samples the pacer probes: every frame gets one slot until it has
+  collected four trusted samples. It drops the first, which carries the game's catch-up after the
+  held frames, and the median of the other three replaces the estimate outright, without smoothing.
+* If `estimate / refresh` is within 0.1 of a whole number, or rounds to at least the cap, the pacer
+  locks to that many evenly spaced slots (`1/n .. n/n`). A game at or above the refresh rate gets
+  `[1]` and is left alone.
 * Otherwise the ratio is fractional and slots are placed at a running phase, so a 45 fps game on
   60 Hz repeats 1, 1, 2 for an average of about 1.33 slots per frame.
 
 All timestamps are in `(0, 1]`, strictly increasing, and at most `cap` of them. A trailing
 timestamp of 1 means the source frame itself is shown in that slot.
 
-`LSFGM_TARGET_FPS` sets the refresh interval to `1 / value` when it parses as a finite positive
-float. Otherwise the refresh comes from `NSScreen.mainScreen.maximumFramesPerSecond`, falling back
+`LSFGM_TARGET_FPS` sets the refresh interval to `1 / value` when it parses as a float from 1 to
+1000. Otherwise the refresh comes from `NSScreen.mainScreen.maximumFramesPerSecond`, falling back
 to 60. Caveat: that is the **main** screen, not the screen the game's window is on, so a game on a
 secondary display with a different refresh rate will be paced against the wrong interval. Use
 `LSFGM_TARGET_FPS` in that case.
@@ -451,11 +520,12 @@ shown so the inserted frames fit inside it.
 
 On the Vulkan path generation goes through the proxy swapchain in both pacing modes: the game
 renders into Metal textures owned by the shim, and the Metal front end's own device generates and
-presents. The game's MoltenVK therefore only needs `VK_EXT_metal_objects`, not version 1.3, and the
-pacer can measure the game's own frame time. Set `LSFGM_VULKAN_PROXY=0` to disable the proxy and
-force the fixed present path, which generates on the game's device, supports fixed pacing only and
-needs the game's MoltenVK to be 1.3 or newer. If the proxy cannot be created the shim falls back on
-its own and logs `Vulkan proxy swapchain failed, using the fixed present path: <what>`.
+presents. With the native generator the game's MoltenVK therefore only needs
+`VK_EXT_metal_objects`, not version 1.3, and the pacer can measure the game's own frame time. Set
+`LSFGM_VULKAN_PROXY=0` to disable the proxy and force the fixed present path, which generates on
+the game's device, supports fixed pacing only and needs the game's MoltenVK to be 1.3 or newer. If
+the proxy cannot be created the shim falls back on its own and logs
+`Vulkan proxy swapchain failed, using the fixed present path: <what>`.
 
 ## Logging and diagnostics
 
@@ -479,7 +549,10 @@ At startup the shim logs the version, the profile and its settings:
 (lsfg-metal) [INFO]:   Multiplier: 4
 (lsfg-metal) [INFO]:   Flow scale: 1.00
 (lsfg-metal) [INFO]:   Performance mode: false
+(lsfg-metal) [INFO]:   Low latency: false
 ```
+
+With `flow_scale = "auto"` the flow line reads `Flow scale: auto`.
 
 **`LSFGM_STATS`.** On the Vulkan fixed present path, every 60th original present:
 
@@ -491,6 +564,12 @@ On the Metal path and the Vulkan proxy, every 60th source frame:
 
 ```
 Frame generation stats pid=<pid> source=<s> original=<o> generated=<g> total=<o+g> source_fps=<fps> slots=<histogram> (metal presents on this layer)
+```
+
+On the OpenGL front end, every 60th source frame, with no `source_fps`:
+
+```
+Frame generation stats pid=<pid> source=<s> original=<o> generated=<g> total=<o+g> slots=<histogram> (opengl swaps on this context)
 ```
 
 Field by field:
@@ -507,7 +586,8 @@ Field by field:
   non-zero counts, joined by single spaces, for example `1:40 2:20` (40 source frames got one slot,
   20 got two). The counts are cleared each time they are printed.
 
-**`LSFGM_PACE_DEBUG`.** One INFO line per source frame on the Metal path:
+**`LSFGM_PACE_DEBUG`.** One INFO line per source frame on the Metal and OpenGL front ends (not the
+Vulkan proxy):
 
 ```
 pace interval=<ms>ms blocked=<ms>ms
@@ -539,9 +619,13 @@ square at intermediate positions. That is the check that the output is interpola
 
 ## Building and packaging
 
-The shim is x86_64: Wine and your Wine build's MoltenVK run under Rosetta. `.cargo/config.toml` pins the
-target and the 11.0 deployment target, so a plain `cargo build` cross-compiles correctly on Apple
-Silicon once the target is installed.
+The shim is x86_64: Wine and your Wine build's MoltenVK run under Rosetta. `.cargo/config.toml`
+pins the target and the 11.0 deployment target, so a plain `cargo build` cross-compiles correctly
+on Apple silicon once the target is installed. It also builds SPIRV-Cross with `NDEBUG`, as its own
+release builds do, so its internal asserts cannot abort a game; the flag is set per target
+(`CXXFLAGS_x86_64_apple_darwin`, `CXXFLAGS_aarch64_apple_darwin`), so a `CXXFLAGS` of your own does
+not drop it. SPIRV-Cross is C++, so building
+needs a C++ compiler: `clang++` from the Xcode command line tools (`xcode-select --install`).
 
 ```sh
 rustup target add x86_64-apple-darwin
@@ -553,8 +637,9 @@ Scripts/package.sh
 `Scripts/package.sh` does not build. It copies the already built
 `target/$LSFGM_TARGET/release/liblsfg_metal.dylib` (default `x86_64-apple-darwin`, set
 `LSFGM_TARGET=aarch64-apple-darwin` for the native build) into `dist/renderers/lsfg/` as
-`libMoltenVK.dylib`, creates the `libMoltenVK.real.dylib` symlink, copies `LICENSE`, writes
-`source.txt`, ad hoc signs the dylib with `codesign -s - -f`, and verifies the export list.
+`libMoltenVK.dylib`, creates the `libMoltenVK.real.dylib` symlink, copies `LICENSE` and
+`THIRD_PARTY.txt`, writes `source.txt`, ad hoc signs the dylib with `codesign -s - -f`, and verifies
+the export list.
 
 Version string. Two independent steps derive one, and they use different rules.
 
@@ -612,15 +697,17 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 36 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
+**Unit tests.** 37 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
-that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, cap
-behaviour, untrusted runs and probing, invalid intervals, the hitch floor on a fast display, a
-closed-loop convergence model), the settings library (environment mode, `auto` flow scale, config
-path precedence, TOML round trip and `~` expansion, error messages, profile identification order
-including the kill switch, executable-name matching and the catch-all profile, reload on mtime
-change), the refresh-interval conversion, the PE resource walk, the feature-chain copy, memory type
-selection, the memory planner, the pipeline signature tables, the recursive mutex, half-float
+that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, simple
+fractions ending on the original, cap behaviour, untrusted runs and probing, a present thread
+blocked for the whole interval, invalid intervals, the hitch floor on a fast display, a closed-loop
+convergence model), the settings library (environment mode, `auto` flow scale and a repeated
+`flow_scale` key, config path precedence, a missing config file, TOML round trip and `~` expansion,
+error messages, profile identification order including the kill switch, executable-name matching
+and the catch-all profile, reload on mtime change), the refresh-interval conversion, the PE resource
+walk, the DLL path fix-up, the feature-chain copy, memory type selection, the memory planner, the
+pipeline signature tables, the 64-pixel minimum frame size, the recursive mutex, half-float
 conversion, the latency probe's percentiles, the present queue governor's skip and backoff, and the
 OpenGL state restore.
 
@@ -629,7 +716,7 @@ centre pixel of the last generated frame.
 
 ```
 usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow]
-                [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench]
+                [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench] [--native]
                 [--in a.ppm b.ppm] [--out dir]
 ```
 
@@ -660,6 +747,15 @@ sit on the barriers between stages, where the encoder ends, so they measure each
 Reading them waits for the GPU after every iteration, so the milliseconds-per-frame line of a
 profiled run is not comparable with an unprofiled one.
 
+`--native` runs the same iterations on the native Metal generator instead, on the default Metal
+device, and needs no `--driver`. Frames go in and out through the same copy kernels the shim uses
+on a game's drawables. It keeps one iteration in flight, as the Vulkan context does, adds
+the GPU time per iteration to the result line, and takes `--in`/`--out`, so a native and a MoltenVK
+run on the same frames can be compared byte for byte. `LSFGM_GPU_PROFILE` applies to the Vulkan run
+only, `--partial` is refused with `--native`, and `--bench` changes nothing there, since the native
+run has no caller side to drop (it is still refused with `--out`). Both runs refuse `-n 0` and a
+size under the 64-pixel minimum after flow scaling.
+
 **`doctor`.** Checks an install without launching a game. Every check prints one `ok`, `warn` or
 `FAIL` line; exit 1 if any check failed, 0 otherwise, so a `warn` alone still exits 0.
 
@@ -669,16 +765,19 @@ usage: doctor [--shim libMoltenVK.dylib] [--dll lsfg-vk.dll] [--app the-binary-t
 
 `--shim` is the installed `libMoltenVK.dylib`: doctor confirms it is the shim rather than a real
 MoltenVK an update put back (the shim exports the `LSFGM_SHIM` marker; a shim older than the
-marker is the one without `vkCreateDevice`), reports the version from `source.txt` beside it, and resolves the real driver, which is
-`LSFGM_MOLTENVK` when set and otherwise `libMoltenVK.real.dylib` beside the shim, catching the
-missing file, the dangling symlink and the case where the real driver is the shim again. Without
-`--shim` it still checks the driver named by `LSFGM_MOLTENVK`. It then loads that driver, reports
-its version and **fails** when `VK_EXT_metal_objects` is missing, classifies what a leaf-name
-lookup of `libMoltenVK.dylib` on `DYLD_LIBRARY_PATH` would find (the shim there is the normal
-launcher install and passes; a real MoltenVK there shadows the shim and warns), parses the shader
-DLL and counts modules, checks the pipeline cache directory is writable, and prints the config file
-and the profile that matches doctor's own process. Discovery of the DLL looks inside `WINEPREFIX`,
-which a launcher sets and a shell does not, so a missing DLL is a `warn`, not a failure; a DLL that
+marker is the one without `vkCreateDevice`), reports the version from `source.txt` beside it, and
+resolves the real driver, which is `LSFGM_MOLTENVK` when set and otherwise `libMoltenVK.real.dylib`
+beside the shim, catching the missing file, the dangling symlink and the case where the real driver
+is the shim again. Without `--shim` it still checks the driver named by `LSFGM_MOLTENVK`. It then
+loads that driver, reports its version and **fails** when it is older than MoltenVK 1.3 or when
+`VK_EXT_metal_objects`, which the proxy path and generation on MoltenVK need, is missing. On an
+Apple silicon GPU (unless `LSFGM_NATIVE=0`) either one is only a `warn`, since the native generator
+needs neither; a MoltenVK 1.2.10 such as CrossOver's is such a case. It then classifies what a
+leaf-name lookup of `libMoltenVK.dylib` on `DYLD_LIBRARY_PATH` would find (the shim there is the
+normal launcher install and passes; a real MoltenVK there shadows the shim and warns), parses the
+shader DLL and counts modules, checks that the pipeline cache directory of generation on MoltenVK
+is writable, and prints the config file and the profile that matches doctor's own process.
+Discovery of the DLL looks inside `WINEPREFIX`, which a launcher sets and a shell does not, so a missing DLL is a `warn`, not a failure; a DLL that
 is not named `lsfg-vk.dll` is a failure, because the default Steam branch ships DXBC shaders that
 parse but cannot generate. With `--app` it runs `codesign` on the binary that is actually injected
 (under Wine that is the engine's `wine`/`wineloader`, not the `.app` the user clicks) and fails
@@ -745,16 +844,21 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
 
 ## Limitations
 
-* Native macOS games are tested on one title (Valheim) and work only when their code signature
-  allows injected libraries.
+* Native macOS games are tested on two titles, the native Valheim (on both generators) and Cemu (on
+  the MoltenVK generator only), and work only when their code signature allows injected libraries.
+* The native generator runs only on Apple silicon GPUs; Intel and AMD GPUs generate on MoltenVK.
+  Generation has never been tested on an Intel or AMD GPU, and only macOS 27 on an M2 has been
+  tested at all.
 * HDR10 has not been tested on an HDR display. The proxy swapchain only presents sRGB and scRGB, so
   HDR10 and float sRGB swapchains use the fixed present path: fixed pacing, generated on the game's
   device, which needs the game's MoltenVK to be 1.3 or newer.
-* Multi-GPU Intel Macs are handled by name only. The Metal front end's private backend picks the
-  Vulkan device whose name matches the `MTLDevice` on the layer, and falls back to the first
-  enumerated one with a warning when no name matches. Two identical GPUs in one machine would be
-  indistinguishable this way, and the OpenGL front end has no layer to ask, so it still takes the
-  first device. Untested: no two-GPU Mac here.
+* Multi-GPU Intel Macs are handled by name only. On the native generator the Metal front end uses
+  the layer's own `MTLDevice` and the OpenGL front end uses `MTLCreateSystemDefaultDevice`, but a
+  multi-GPU Mac has no Apple silicon GPU, so it generates on MoltenVK. There the Metal front end's
+  private backend picks the Vulkan device whose name matches the `MTLDevice` on the layer, and falls
+  back to the first enumerated one with a warning when no name matches. Two identical GPUs in one
+  machine would be indistinguishable this way, and the OpenGL front end has no layer to ask, so it
+  still takes the first device. Untested: no two-GPU Mac here.
 * The refresh rate comes from the main screen only. A game on a secondary display with a different
   refresh rate is paced against the wrong interval unless `LSFGM_TARGET_FPS` is set. The Metal front
   end re-reads it whenever it rebuilds, on a size or format change, not continuously.
@@ -795,5 +899,7 @@ that results from using it. See `LICENSE` for the binding text.
 This is an independent implementation. It was written from a functional specification of
 observable behaviour rather than from any existing sources or projects.
 
-This project is MIT licensed. See `LICENSE`. The shader package it loads is not covered by that
-license and remains the property of Lossless Scaling.
+This project is MIT licensed. See `LICENSE`. The library statically links SPIRV-Cross and
+third-party Rust crates, including the Rust standard library; their notices are in
+`THIRD_PARTY.txt`, which ships beside the library. The shader package it loads is not covered by
+that license and remains the property of Lossless Scaling.
