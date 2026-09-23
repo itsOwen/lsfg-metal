@@ -77,10 +77,155 @@ fn write_ppm(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), 
     std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+struct Run {
+    w: u32,
+    h: u32,
+    m: u32,
+    flow: f32,
+    iters: u32,
+    perf: bool,
+    fp16: bool,
+    hdr: bool,
+}
+
+// the same run on the native metal generator: one command buffer per iteration, one iteration in flight; there is no caller sync to drop, so --bench changes nothing here
+fn run_native(
+    r: &Run,
+    res: &std::collections::HashMap<u32, Vec<u32>>,
+    frames: Option<&[Vec<u8>; 2]>,
+    out: Option<&std::path::Path>,
+) -> Result<(), String> {
+    use lsfg_metal::generator::native::Pipeline;
+    use objc2_metal::{
+        MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+        MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize,
+        MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    };
+    let (w, h, m) = (r.w, r.h, r.m);
+    let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+    let queue = device.newCommandQueue().ok_or("no Metal queue")?;
+    let t0 = Instant::now();
+    let mut p = Pipeline::new(&device, res, r.fp16, (w, h), r.flow, r.perf, r.hdr, relog)?;
+    let build = t0.elapsed();
+    let bpp = if r.hdr { 8 } else { 4 };
+    let len = w as usize * h as usize * bpp;
+    let buffer = |bytes: &[u8]| {
+        let b = device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or("no Metal buffer")?;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr() as *mut u8, bytes.len()) };
+        Ok::<_, String>(b)
+    };
+    // synthetic input as in the vulkan run: red and blue swinging, green 0.25
+    let solid = |x: usize| -> Vec<u8> {
+        let px: Vec<u8> = if r.hdr {
+            let one = |v: bool| if v { 0x3c00u16 } else { 0 };
+            [one(x == 1), 0x3400, one(x == 0), 0x3c00].iter().flat_map(|v| v.to_le_bytes()).collect()
+        } else {
+            vec![255 * x as u8, 64, 255 * (1 - x) as u8, 255]
+        };
+        px.repeat(w as usize * h as usize)
+    };
+    // the frames go in and out through the shim's own copies, on textures standing in for the game's drawables
+    let size = MTLSize { width: w as usize, height: h as usize, depth: 1 };
+    let origin = MTLOrigin { x: 0, y: 0, z: 0 };
+    let format = if r.hdr { MTLPixelFormat::RGBA16Float } else { MTLPixelFormat::RGBA8Unorm };
+    let texture = |bytes: &[u8]| {
+        let d = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(format, w as usize, h as usize, false)
+        };
+        d.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+        d.setStorageMode(MTLStorageMode::Shared);
+        let t = device.newTextureWithDescriptor(&d).ok_or("no Metal texture")?;
+        if !bytes.is_empty() {
+            let region = MTLRegion { origin, size };
+            let px = std::ptr::NonNull::new(bytes.as_ptr() as *mut _).ok_or("empty frame")?;
+            unsafe { t.replaceRegion_mipmapLevel_withBytes_bytesPerRow(region, 0, px, w as usize * bpp) };
+        }
+        Ok::<_, String>(t)
+    };
+    let inputs = match frames {
+        Some(f) => [texture(&f[0])?, texture(&f[1])?],
+        None => [texture(&solid(0))?, texture(&solid(1))?],
+    };
+    let targets: Vec<_> = (0..m - 1).map(|_| texture(&[])).collect::<Result<_, _>>()?;
+    let reads: Vec<_> = (0..m - 1).map(|_| buffer(&[])).collect::<Result<_, _>>()?;
+    let (mut last, mut ts, mut gpu): (Option<objc2::rc::Retained<_>>, f32, f64) = (None, 0.0, 0.0);
+    let t1 = Instant::now();
+    for it in 0..r.iters {
+        let cb = queue.commandBuffer().ok_or("no Metal command buffer")?;
+        p.copy_in(&cb, &inputs[it as usize % 2], it % 2)?;
+        p.encode(&cb, false, it, ts)?;
+        for k in 0..m - 1 {
+            ts = (k + 1) as f32 / m as f32;
+            p.encode(&cb, true, it, ts)?;
+            if out.is_some() && it + 1 == r.iters {
+                let target = &targets[k as usize];
+                p.copy_out(&cb, target)?;
+                let blit = cb.blitCommandEncoder().ok_or("no blit encoder")?;
+                unsafe {
+                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                        target, 0, 0, origin, size, &reads[k as usize], 0, w as usize * bpp, len,
+                    )
+                };
+                blit.endEncoding();
+            }
+        }
+        // the vulkan context settles the previous iteration before it starts the next
+        if let Some(prev) = last.take() {
+            let prev: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer> = &prev;
+            prev.waitUntilCompleted();
+            gpu += prev.GPUEndTime() - prev.GPUStartTime();
+        }
+        cb.commit();
+        last = Some(cb);
+    }
+    if let Some(prev) = last {
+        prev.waitUntilCompleted();
+        gpu += prev.GPUEndTime() - prev.GPUStartTime();
+    }
+    let run = t1.elapsed();
+    if let Some(dir) = out {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for (k, b) in reads.iter().enumerate() {
+            let px = unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, len) };
+            write_ppm(&dir.join(format!("generated_{k}.ppm")), w, h, px)?;
+        }
+    }
+    let cb = queue.commandBuffer().ok_or("no Metal command buffer")?;
+    let blit = cb.blitCommandEncoder().ok_or("no blit encoder")?;
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+            p.destination(), 0, 0, origin, size, &reads[0], 0, w as usize * bpp, len,
+        )
+    };
+    blit.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+    let off = (h as usize / 2 * w as usize + w as usize / 2) * bpp;
+    let pixel = unsafe { std::slice::from_raw_parts((reads[0].contents().as_ptr() as *const u8).add(off), bpp) };
+    let frames = r.iters * (m - 1);
+    println!(
+        "{w}x{h} m={m} flow={:.2} {} fp16={} hdr={} native: build {:.0} ms, {} iterations / {frames} generated frames in {:.1} ms = {:.2} ms per iteration, {:.2} ms per generated frame, gpu {:.2} ms per iteration, centre pixel {:02x?}",
+        r.flow,
+        if r.perf { "performance" } else { "quality" },
+        r.fp16,
+        r.hdr,
+        build.as_secs_f64() * 1e3,
+        r.iters,
+        run.as_secs_f64() * 1e3,
+        run.as_secs_f64() * 1e3 / r.iters as f64,
+        run.as_secs_f64() * 1e3 / frames as f64,
+        gpu * 1e3 / r.iters as f64,
+        pixel
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let (mut w, mut h, mut m, mut flow, mut iters) = (1920u32, 1080u32, 2u32, 1.0f32, 10u32);
     let (mut perf, mut fp16, mut hdr, mut partial) = (false, true, false, false);
-    let (mut bench, mut input, mut out) = (false, None, None);
+    let (mut bench, mut native, mut input, mut out) = (false, false, None, None);
     let mut driver = env("LSFGM_MOLTENVK").map(PathBuf::from);
     let mut dll = env("LSFGM_DLL_PATH")
         .map(PathBuf::from)
@@ -101,9 +246,10 @@ fn run() -> Result<(), String> {
             "--hdr" => hdr = true,
             "--partial" => partial = true,
             "--bench" => bench = true,
+            "--native" => native = true,
             "--in" => input = Some((PathBuf::from(val()?), PathBuf::from(val()?))),
             "--out" => out = Some(PathBuf::from(val()?)),
-            _ => return Err("usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow] [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench] [--in a.ppm b.ppm] [--out dir]".into()),
+            _ => return Err("usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow] [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench] [--native] [--in a.ppm b.ppm] [--out dir]".into()),
         }
     }
     if !(2..=4).contains(&m) || !(0.25..=1.0).contains(&flow) {
@@ -135,8 +281,23 @@ fn run() -> Result<(), String> {
     if w == 0 || h == 0 {
         return Err("size must be positive".into());
     }
-    let driver = driver.ok_or("no driver: pass --driver or set LSFGM_MOLTENVK")?;
+    if iters == 0 {
+        return Err("-n must be at least 1".into());
+    }
+    // the shim shows such frames without generation, so there is nothing to validate
+    if !lsfg_metal::generator::signature::Signature::new(perf).fits(w, h, flow) {
+        return Err(format!("{w}x{h} at flow {flow} is below the 64 pixel minimum after flow scaling"));
+    }
+    if native && partial {
+        return Err("--partial tests the Vulkan context; it does not apply to --native".into());
+    }
     let dll = dll.ok_or("no dll: pass --dll or set LSFGM_DLL_PATH")?;
+    if native {
+        let res = shaders::parse(&std::fs::read(&dll).map_err(|e| format!("{}: {e}", dll.display()))?)?;
+        let run = Run { w, h, m, flow, iters, perf, fp16, hdr };
+        return run_native(&run, &res, frames.as_ref().map(|f| &f.1), out.as_deref());
+    }
+    let driver = driver.ok_or("no driver: pass --driver or set LSFGM_MOLTENVK")?;
 
     let t0 = Instant::now();
     let inst = Arc::new(Instance::own(&driver, "", &dll, fp16, false, relog)?);

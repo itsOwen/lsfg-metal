@@ -1,4 +1,5 @@
 // generator library: instance (own / adopt) and context with the timeline protocol
+pub mod native;
 pub mod pipeline;
 pub mod signature;
 
