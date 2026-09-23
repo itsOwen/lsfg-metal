@@ -201,7 +201,8 @@ pub fn display_refresh() -> f64 {
     let target = std::env::var("LSFGM_TARGET_FPS")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .filter(|f| f.is_finite() && *f > 0.0);
+        // beyond real displays the pacing math turns seconds into durations that overflow
+        .filter(|f| (1.0..=1000.0).contains(f));
     1.0 / target.unwrap_or_else(|| {
         let fps = main_screen_fps();
         if fps <= 0 {
