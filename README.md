@@ -244,7 +244,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_VULKAN_PROXY` | proxy swapchain on the Vulkan path, generating on the shim's own device | `0` disables it and forces the fixed present path | unset, proxy used when supported |
 | `LSFGM_TARGET_FPS` | override the display refresh used by the pacer | finite positive float, whole string | unset, the main screen's rate |
 | `LSFGM_STATS` | periodic statistics lines | read by **presence** | unset |
-| `LSFGM_LATENCY` | Metal presentation latency, p50/p95 every 120 callbacks per frame kind | read by **presence** | unset |
+| `LSFGM_LATENCY` | Metal presentation latency, p50/p95 every 120 callbacks per frame kind, and on-screen intervals (p50, p95, stdev, frames held past 1.5 intervals) every 240 presents | read by **presence** | unset |
 | `LSFGM_PACE_DEBUG` | per-frame estimator log line | read by **presence** | unset |
 | `LSFGM_METAL_DUMP` | frame dump directory (Metal path) | directory path | unset |
 | `LSFGM_GPU_PROFILE` | GPU timestamps around every generator stage, printed by `validate` | read by **presence** | unset |
