@@ -82,8 +82,7 @@ pub struct Profile {
 }
 
 impl Profile {
-    // flow scale for a source of this height; auto follows lossless scaling's own advice,
-    // 100% at 1080p, 75% at 1440p, 50% at 2160p
+    // flow scale for this source height; auto is lossless scaling's advice, 1080 over the height
     pub fn flow_for(&self, height: u32) -> f32 {
         if self.flow_auto {
             (1080.0 / height.max(1) as f32).clamp(0.25, 1.0)
@@ -207,7 +206,7 @@ fn env_profile(env: Env) -> Result<Profile, String> {
             .ok_or("Invalid LSFGM_MULTIPLIER")?;
     }
     if let Some(v) = nonempty(env, "LSFGM_FLOW_SCALE") {
-        p.flow_auto = v.eq_ignore_ascii_case("auto");
+        p.flow_auto = v.trim().eq_ignore_ascii_case("auto");
         if !p.flow_auto {
             p.flow_scale = strtof(&v);
         }
@@ -470,6 +469,7 @@ pub fn parse(text: &str, env: Env) -> Result<Config, String> {
                     "flow_scale" => match val {
                         Val::Str(s) if s.eq_ignore_ascii_case("auto") => p.flow_auto = true,
                         _ => {
+                            p.flow_auto = false;
                             p.flow_scale = typed(
                                 match val {
                                     Val::Float(f) => Some(f as f32),
@@ -499,7 +499,7 @@ pub fn parse(text: &str, env: Env) -> Result<Config, String> {
     }
     for p in &cfg.profiles {
         if p.multiplier > 4 {
-            return Err("Profile multipliers must be 1 to 4".into());
+            return Err(format!("Profile '{}' has multiplier > 4", p.name));
         }
         if p.multiplier < 1 {
             return Err(format!("Profile '{}' has multiplier < 1", p.name));
@@ -554,7 +554,7 @@ pub fn to_toml(cfg: &Config) -> String {
         }
         let _ = writeln!(
             out,
-            "pacing_mode = {}\nmultiplier = {}\nflow_scale = {}\nperformance_mode = {}\noverride_present_mode = {}\npreserve_swapchain_image_count = {}\nlow_latency = {}",
+            "pacing_mode = {}\nmultiplier = {}\nflow_scale = {}\nperformance_mode = {}\noverride_present_mode = {}\npreserve_swapchain_image_count = {}",
             q(p.pacing_mode.name()),
             p.multiplier,
             if p.flow_auto {
@@ -564,9 +564,12 @@ pub fn to_toml(cfg: &Config) -> String {
             },
             p.performance_mode,
             p.override_present_mode,
-            p.preserve_swapchain_image_count,
-            p.low_latency
+            p.preserve_swapchain_image_count
         );
+        // written only when on, so an older shim sharing the file still reads it
+        if p.low_latency {
+            let _ = writeln!(out, "low_latency = true");
+        }
     }
     out
 }
@@ -575,7 +578,13 @@ pub fn write(cfg: &Config, path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, to_toml(cfg))
+    // a rename, so another process never reads a half-written file
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, to_toml(cfg))
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
 }
 
 // mtime polling; a failed parse keeps the old mtime so the next call retries, but the error is reported once per mtime
@@ -808,6 +817,15 @@ mod tests {
         assert!(cfg.profiles[0].flow_auto);
         assert_eq!(parse(&to_toml(&cfg), &env(&[])).unwrap(), cfg);
         assert!(load_with(&env(&[("LSFGM_ENV", "1"), ("LSFGM_FLOW_SCALE", "0")])).is_err());
+        // spaces around auto are fine, as around a number
+        let e = env(&[("LSFGM_ENV", "1"), ("LSFGM_FLOW_SCALE", " auto ")]);
+        assert!(load_with(&e).unwrap().profiles[0].flow_auto);
+        // low_latency is written only when on, so an older shim can still read a default file
+        assert!(!to_toml(&Config::builtin()).contains("low_latency"));
+        // the last of two flow_scale keys wins, auto or not
+        let t = "version = 2\n[global]\n[[profile]]\nflow_scale = \"auto\"\nflow_scale = 0.5\n";
+        let p = &parse(t, &env(&[])).unwrap().profiles[0];
+        assert_eq!((p.flow_auto, p.flow_for(2160)), (false, 0.5));
     }
 
     #[test]
@@ -1033,8 +1051,8 @@ mod tests {
             "Unrecognized pacing mode: x"
         );
         assert_eq!(
-            err("version = 2\n[global]\n[[profile]]\nmultiplier = 5\n"),
-            "Profile multipliers must be 1 to 4"
+            err("version = 2\n[global]\n[[profile]]\nmultiplier = 5\nname = \"p\"\n"),
+            "Profile 'p' has multiplier > 4"
         );
         assert_eq!(
             err("version = 2\n[global]\n[[profile]]\nmultiplier = 0\nname = \"p\"\n"),
