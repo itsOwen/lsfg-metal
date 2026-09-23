@@ -80,22 +80,23 @@ pub struct Generator {
     pool_cap: AtomicU32,
     // set when a pool of two held the game up; it stays at three from then on
     cap_released: AtomicBool,
-    // how long the game may wait on a pool of two, in nanoseconds: four display-locked intervals, since the step
-    // down from three alone waits about two while the frames already queued reach the screen
+    // nanoseconds the game may wait on a pool of two: four display-locked intervals, twice what the step down takes
     cap_patience: AtomicU64,
 }
 unsafe impl Send for Generator {}
 unsafe impl Sync for Generator {}
 
 impl Generator {
-    // how many frames the game may hold between acquire and display, for a caller that has waited this long;
-    // a game that needs a third one (two acquires before a present) must not wait on a pool of two for long
+    // frames the game may hold for a caller that waited this long; one that acquires twice gets the third soon
     pub fn pool_cap(&self, waited: Duration) -> usize {
-        let cap = self.pool_cap.load(Ordering::Relaxed);
+        // acquire pairs with the worker's release, so a cap of two never comes with a patience of zero
+        let cap = self.pool_cap.load(Ordering::Acquire);
         let patience = Duration::from_nanos(self.cap_patience.load(Ordering::Relaxed));
         if cap < 3 && waited >= patience {
-            self.pool_cap.store(3, Ordering::Relaxed);
-            if !self.cap_released.swap(true, Ordering::Relaxed) {
+            // released before the cap rises, so a worker that lowers it again sees why and undoes it
+            let first = !self.cap_released.swap(true, Ordering::AcqRel);
+            self.pool_cap.store(3, Ordering::Release);
+            if first {
                 log::info("Metal source waited on two drawables, going back to three");
             }
             return 3;
@@ -106,8 +107,7 @@ impl Generator {
 
 static GENERATORS: Mutex<Option<HashMap<usize, &'static Generator>>> = Mutex::new(None);
 
-// the game and the display run at the same rate, so a frame stuck in the present queue never drains by itself;
-// when the first generated frame keeps waiting for a drawable, one generated frame is skipped to drain it
+// at the display-locked rate a stuck present never drains, so one generated frame is skipped when the first keeps waiting
 #[derive(Default)]
 struct Governor {
     refresh: f64,
@@ -243,7 +243,7 @@ impl Generator {
         self.device.newTextureWithDescriptor(&desc)
     }
 
-    // pool of drawables handed to the game, at most three outstanding
+    // pool of drawables handed to the game, at most pool_cap outstanding
     pub fn acquire_drawable(&'static self) -> Option<Retained<ProxyDrawable>> {
         let size = self.layer.drawableSize();
         if size.width < 1.0 || size.height < 1.0 {
@@ -1038,8 +1038,7 @@ struct Worker {
     stats: Stats,
     stats_on: bool,
     dump_dir: Option<PathBuf>,
-    // fixed pacing: recent source intervals, whether the source runs at the display-locked rate,
-    // and whether a pool of two ever held the game back
+    // fixed pacing: recent source intervals, the display-locked rate, and whether two drawables held the game back
     intervals: Vec<f64>,
     locked: bool,
     throttled: bool,
@@ -1417,14 +1416,21 @@ impl Worker {
             return;
         }
         let cap = &self.gen.pool_cap;
-        if cap.load(Ordering::Relaxed) == 3 && self.locked {
+        if cap.load(Ordering::Acquire) == 3 && self.locked {
             let patience = Duration::from_secs_f64(locked * 4.0);
             self.gen.cap_patience.store(patience.as_nanos() as u64, Ordering::Relaxed);
-            cap.store(2, Ordering::Relaxed);
-            log::info("Metal source runs at the display-locked rate, holding the game to two drawables");
-        } else if cap.load(Ordering::Relaxed) == 2 && median > locked * 1.05 {
-            cap.store(3, Ordering::Relaxed);
-            self.gen.cap_released.store(true, Ordering::Relaxed);
+            if cap.compare_exchange(3, 2, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                // the game gave up on two between the check above and here
+                if self.gen.cap_released.load(Ordering::Acquire) {
+                    cap.store(3, Ordering::Release);
+                    self.throttled = true;
+                } else {
+                    log::info("Metal source runs at the display-locked rate, holding the game to two drawables");
+                }
+            }
+        } else if cap.load(Ordering::Acquire) == 2 && median > locked * 1.05 {
+            self.gen.cap_released.store(true, Ordering::Release);
+            cap.store(3, Ordering::Release);
             self.throttled = true;
             // a game waiting on the pool may take the third drawable now
             let _pool = self.gen.pool.lock().unwrap();
@@ -1594,6 +1600,8 @@ impl Worker {
             Some(p) => p.slots(job.sample),
             None => (1..=m).map(|i| i as f64 / m as f64).collect(),
         };
+        // a skip keeps each remaining frame's share of the source interval
+        let count = slots.len();
         let slots = {
             let mut g = self.gen.governor.lock().unwrap();
             g.refresh = self.refresh;
@@ -1614,6 +1622,7 @@ impl Worker {
             // only a source at the display-locked rate cannot drain a backlog; a slower one drains it by itself
             let skip = std::mem::take(&mut g.skip);
             let take = skip
+                && slots.len() > 1
                 && self.setup.profile.low_latency
                 && self.locked
                 && self.stats.source >= self.cap_settled;
@@ -1629,7 +1638,8 @@ impl Worker {
                     "Metal present queue backed up (first generated frame waits {:.1} ms for a drawable), skipping one generated frame",
                     g.backlog * 1000.0
                 ));
-                vec![1.0]
+                // the first one only, so the rest keep their slots and the queue drains by one frame
+                slots[1..].to_vec()
             } else {
                 slots
             }
@@ -1637,7 +1647,7 @@ impl Worker {
         let show_original = *slots.last().unwrap() >= 1.0;
         let inserted = slots.len() - show_original as usize;
         let duration = if job.duration > 0.0 {
-            job.duration / slots.len() as f64
+            job.duration / count as f64
         } else {
             0.0
         };
@@ -1654,7 +1664,7 @@ impl Worker {
             let waited = super::now();
             let target = self.next_real("no drawable for a generated frame")?;
             let acquire_ms = (job.latency.clock() - acquire_start) * 1000.0;
-            if i == 0 {
+            if i == 0 && self.setup.profile.low_latency {
                 self.gen.governor.lock().unwrap().wait(super::now() - waited);
             }
             let ttex = target.texture();
@@ -1680,7 +1690,9 @@ impl Worker {
             let acquire_ms = (job.latency.clock() - acquire_start) * 1000.0;
             let ready = self.original(&texture, &target.texture(), inserted)?;
             forward_presented(job.drawable.clone(), &target);
-            govern(self.gen, &target, job.latency.committed);
+            if self.setup.profile.low_latency {
+                govern(self.gen, &target, job.latency.committed);
+            }
             self.gen.latency.attach(
                 &target,
                 job.latency,
