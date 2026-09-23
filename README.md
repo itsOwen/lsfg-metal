@@ -50,7 +50,9 @@ Three hooks cover the renderers a Wine bottle can use:
   and `CAMetalLayer`s in `RGBA16Float` with `kCGColorSpaceExtendedLinearSRGB`. On the Vulkan path
   also HDR10: 10-bit with `VK_COLOR_SPACE_HDR10_ST2084_EXT`.
 * Generated frames of 10-bit and float sources pass through 8-bit images, so they can band slightly
-  in smooth gradients; the game's own frames are untouched. Any other format keeps native
+  in smooth gradients; the game's own frames are untouched. sRGB sources are copied as their encoded
+  bytes on the Metal path and the proxy swapchain; the Vulkan fixed present path still converts them
+  to linear 8-bit, which crushes dark tones in generated frames. Any other format keeps native
   presentation and the log names its format and colour space.
 
 Everything else keeps native presentation.

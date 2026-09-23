@@ -770,6 +770,8 @@ struct Worker {
     pacer: Option<Pacer>,
     extent: (u32, u32),
     format: vk::Format,
+    // srgb and unorm share a vulkan format, so a switch between them is only visible here
+    pixel_format: MTLPixelFormat,
     imports: HashMap<usize, Import>,
     sems: Option<(vk::Semaphore, vk::Semaphore, vk::Fence)>,
     frame_pending: bool,
@@ -791,6 +793,7 @@ impl Worker {
             pacer: None,
             extent: (0, 0),
             format: vk::Format::UNDEFINED,
+            pixel_format: MTLPixelFormat::Invalid,
             imports: HashMap::new(),
             sems: None,
             frame_pending: false,
@@ -877,7 +880,10 @@ impl Worker {
     fn prepare(&mut self, texture: &ProtocolObject<dyn MTLTexture>) -> Result<(), Fail> {
         let (w, h) = (texture.width() as u32, texture.height() as u32);
         let format = vk_format(texture.pixelFormat())?;
-        if self.ctx.is_some() && (w, h) == self.extent && format == self.format {
+        if self.ctx.is_some()
+            && (w, h) == self.extent
+            && texture.pixelFormat() == self.pixel_format
+        {
             return Ok(());
         }
         self.reset();
@@ -915,6 +921,7 @@ impl Worker {
         }
         self.extent = (w, h);
         self.format = format;
+        self.pixel_format = texture.pixelFormat();
         Ok(())
     }
 
@@ -937,11 +944,23 @@ impl Worker {
             self.extent,
             vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
         );
-        let image = import_texture(&b.device, texture, info)?;
+        // moltenvk samples the texture as it is, so an srgb one would be linearised by the swizzling blits
+        let unorm = match texture.pixelFormat() {
+            MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
+            MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
+            _ => None,
+        };
+        let view = match unorm {
+            Some(f) => texture
+                .newTextureViewWithPixelFormat(f)
+                .ok_or("could not create a unorm view of an srgb drawable")?,
+            None => texture.retain(),
+        };
+        let image = import_texture(&b.device, &view, info)?;
         self.imports.insert(
             key,
             Import {
-                _texture: texture.retain(),
+                _texture: view,
                 image,
             },
         );
