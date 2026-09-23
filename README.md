@@ -42,7 +42,7 @@ Three hooks cover the renderers a Wine bottle can use:
   rejected by the settings library.
 * Pacing: fixed (`vsync`, evenly spaced timestamps `1/m .. m/m`) and adaptive (the pacer fits
   generated frames to display slots).
-* Performance mode (the performance shader set) and flow scale 0.25 to 1.0.
+* Performance mode (the performance shader set) and flow scale 0.25 to 1.0, or `auto`.
 * SDR formats: single-layer 8-bit RGBA8/BGRA8 (unorm or sRGB), 10-bit `A2B10G10R10` /
   `A2R10G10B10` (what Unreal Engine games present) and, on the Vulkan path, `R16G16B16A16_SFLOAT`
   in sRGB. On the Metal path: BGRA8/RGBA8, `RGB10A2Unorm` and `BGR10A2Unorm` layers.
@@ -228,7 +228,7 @@ library builds one profile named `(environment)` from the variables below and us
 |---|---|---|---|
 | `LSFGM_ENV` | selects environment-profile mode | read by **presence**, any value including empty | unset (file mode) |
 | `LSFGM_MULTIPLIER` | frames shown per source frame | unsigned decimal, whole string, at most 2^32-1; 2 to 4 | 2 |
-| `LSFGM_FLOW_SCALE` | flow resolution scale | float, 0.25 to 1.0 | 1.0 |
+| `LSFGM_FLOW_SCALE` | flow resolution scale | float, 0.25 to 1.0, or `auto` (see below) | 1.0 |
 | `LSFGM_PERFORMANCE_MODE` | use the performance shader set | `1` is true, any other non-empty value is false | false |
 | `LSFGM_PACING_MODE` | pacing | `vsync` or `none` (fixed), `adaptive`; matched case-insensitively | `vsync` |
 | `LSFGM_OVERRIDE_PRESENT_MODE` | force vsync: FIFO on wrapped swapchains, `displaySyncEnabled` on Metal layers; `0` leaves the game's own present mode and display sync in place on every path | `1` is true, other non-empty is false | true |
@@ -279,7 +279,7 @@ variable.
 
 Validation errors in environment mode: `Invalid LSFGM_MULTIPLIER`,
 `The macOS shim supports multipliers from 2 to 4`, `LSFGM_MULTIPLIER must be greater than 1`,
-`LSFGM_FLOW_SCALE must be between 0.25 and 1.0`.
+`LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto`.
 
 When `LSFGM_DLL_PATH` is unset the shader package is looked for in Steam under `HOME`, then in
 Steam inside the Wine prefix named by `WINEPREFIX`, then in the working directory. A launcher
@@ -344,8 +344,8 @@ Supported subset of TOML:
   tables. Unknown keys are errors (`Unknown key in configuration: <key>`,
   `Unknown key in [global] section: <key>`, `Unknown key in profile section: <key>`).
 * A profile's `multiplier` must be 1 to 4 (above 4 is `Profile multipliers must be 1 to 4`, below 1
-  is `Profile '<name>' has multiplier < 1`) and its `flow_scale` 0.25 to 1.0. Multiplier 1 is
-  accepted here and disables generation; environment mode is stricter and requires 2 to 4.
+  is `Profile '<name>' has multiplier < 1`) and its `flow_scale` 0.25 to 1.0 or `"auto"`. Multiplier
+  1 is accepted here and disables generation; environment mode is stricter and requires 2 to 4.
 
 Reload on change: the shim stats the config file at every present and records its modification time
 as `(seconds, nanoseconds)`. When the mtime changes it reparses, logs
@@ -359,6 +359,13 @@ present and costs nothing beyond the extra inner passes it allocates. `override_
 created, so changing them takes effect only when the game recreates it. Only the Vulkan fixed present path checks the
 watcher: the Metal front end and the Vulkan proxy path capture the profile once when they are set
 up, so a config change does not reach them until the swapchain or layer is rebuilt.
+
+`flow_scale = "auto"` picks 1080 divided by the source height, clamped to 0.25 to 1.0: 1.0 at 1080p,
+0.75 at 1440p, 0.5 at 2160p, which is the scale Lossless Scaling itself recommends for each. Every
+pass except the final full-resolution one runs at the flow resolution, so it sets most of the GPU
+cost. On an M2 at 2940x1846 (a Retina panel at native resolution) one generated frame in quality
+mode costs 23.4 ms at 1.0, 12.4 ms at 0.62 and 9.3 ms at 0.5; auto picks 0.59 there. It is chosen
+again whenever the context is rebuilt for a new size.
 
 `low_latency` (Metal path and Vulkan proxy swapchain, fixed pacing, off by default). A game and a
 display that run at the same rate never drain a frame that got stuck in the present queue, and a
@@ -605,11 +612,11 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 35 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
+**Unit tests.** 36 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, cap
 behaviour, untrusted runs and probing, invalid intervals, the hitch floor on a fast display, a
-closed-loop convergence model), the settings library (environment mode, config
+closed-loop convergence model), the settings library (environment mode, `auto` flow scale, config
 path precedence, TOML round trip and `~` expansion, error messages, profile identification order
 including the kill switch, executable-name matching and the catch-all profile, reload on mtime
 change), the refresh-interval conversion, the PE resource walk, the feature-chain copy, memory type
@@ -727,7 +734,7 @@ cargo run --release --example mtlclear -- 240
 ```
 
 A correct run logs `lsfg-metal metal front end active` and a
-`Metal presentation <w>x<h> (<format>), <multiplier m|adaptive up to m>, display <n> Hz` line,
+`Metal presentation <w>x<h> (<format>), <multiplier m|adaptive up to m>, display <n> Hz, flow <f>` line,
 streams `Frame generation stats` with `source`, `original` and `generated` all advancing, and
 prints `<n> frames in <s>s = <f> fps` at the end. On 60 Hz that rate is about 30 at 2x, 20 at 3x and
 15 at 4x. With `MTLTEST_FPS=45 LSFGM_PACING_MODE=adaptive LSFGM_MULTIPLIER=4` the stats line shows

@@ -290,7 +290,7 @@ unsafe fn generate(
             cgl,
             extent,
             p.multiplier,
-            p.flow_scale,
+            p.flow_for(extent.1),
             p.performance_mode,
             adaptive,
         )?;

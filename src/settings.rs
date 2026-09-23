@@ -74,10 +74,27 @@ pub struct Profile {
     pub pacing_mode: PacingMode,
     pub multiplier: u32,
     pub flow_scale: f32,
+    pub flow_auto: bool,
     pub performance_mode: bool,
     pub override_present_mode: bool,
     pub preserve_swapchain_image_count: bool,
     pub low_latency: bool,
+}
+
+impl Profile {
+    // flow scale for a source of this height; auto follows lossless scaling's own advice,
+    // 100% at 1080p, 75% at 1440p, 50% at 2160p
+    pub fn flow_for(&self, height: u32) -> f32 {
+        if self.flow_auto {
+            (1080.0 / height.max(1) as f32).clamp(0.25, 1.0)
+        } else {
+            self.flow_scale
+        }
+    }
+
+    fn flow_valid(&self) -> bool {
+        self.flow_auto || (0.25..=1.0).contains(&self.flow_scale)
+    }
 }
 
 impl Default for Profile {
@@ -88,6 +105,7 @@ impl Default for Profile {
             pacing_mode: PacingMode::Vsync,
             multiplier: 2,
             flow_scale: 1.0,
+            flow_auto: false,
             performance_mode: false,
             override_present_mode: true,
             preserve_swapchain_image_count: false,
@@ -189,7 +207,10 @@ fn env_profile(env: Env) -> Result<Profile, String> {
             .ok_or("Invalid LSFGM_MULTIPLIER")?;
     }
     if let Some(v) = nonempty(env, "LSFGM_FLOW_SCALE") {
-        p.flow_scale = strtof(&v);
+        p.flow_auto = v.eq_ignore_ascii_case("auto");
+        if !p.flow_auto {
+            p.flow_scale = strtof(&v);
+        }
     }
     if let Some(v) = nonempty(env, "LSFGM_PERFORMANCE_MODE") {
         p.performance_mode = v == "1";
@@ -212,8 +233,8 @@ fn env_profile(env: Env) -> Result<Profile, String> {
     if p.multiplier <= 1 {
         return Err("LSFGM_MULTIPLIER must be greater than 1".into());
     }
-    if !(0.25..=1.0).contains(&p.flow_scale) {
-        return Err("LSFGM_FLOW_SCALE must be between 0.25 and 1.0".into());
+    if !p.flow_valid() {
+        return Err("LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto".into());
     }
     Ok(p)
 }
@@ -446,16 +467,19 @@ pub fn parse(text: &str, env: Env) -> Result<Config, String> {
                             typed(if let Val::Int(i) = val { Some(i) } else { None }, key)?
                                 .clamp(0, u32::MAX as i64) as u32
                     }
-                    "flow_scale" => {
-                        p.flow_scale = typed(
-                            match val {
-                                Val::Float(f) => Some(f as f32),
-                                Val::Int(i) => Some(i as f32),
-                                _ => None,
-                            },
-                            key,
-                        )?
-                    }
+                    "flow_scale" => match val {
+                        Val::Str(s) if s.eq_ignore_ascii_case("auto") => p.flow_auto = true,
+                        _ => {
+                            p.flow_scale = typed(
+                                match val {
+                                    Val::Float(f) => Some(f as f32),
+                                    Val::Int(i) => Some(i as f32),
+                                    _ => None,
+                                },
+                                key,
+                            )?
+                        }
+                    },
                     "performance_mode" => p.performance_mode = as_bool(val, key)?,
                     "override_present_mode" => p.override_present_mode = as_bool(val, key)?,
                     "preserve_swapchain_image_count" => {
@@ -480,9 +504,9 @@ pub fn parse(text: &str, env: Env) -> Result<Config, String> {
         if p.multiplier < 1 {
             return Err(format!("Profile '{}' has multiplier < 1", p.name));
         }
-        if !(0.25..=1.0).contains(&p.flow_scale) {
+        if !p.flow_valid() {
             return Err(format!(
-                "Profile '{}' has flow_scale out of range (must be between 0.25 and 1.0)",
+                "Profile '{}' has flow_scale out of range (must be between 0.25 and 1.0, or \"auto\")",
                 p.name
             ));
         }
@@ -530,10 +554,14 @@ pub fn to_toml(cfg: &Config) -> String {
         }
         let _ = writeln!(
             out,
-            "pacing_mode = {}\nmultiplier = {}\nflow_scale = {:?}\nperformance_mode = {}\noverride_present_mode = {}\npreserve_swapchain_image_count = {}\nlow_latency = {}",
+            "pacing_mode = {}\nmultiplier = {}\nflow_scale = {}\nperformance_mode = {}\noverride_present_mode = {}\npreserve_swapchain_image_count = {}\nlow_latency = {}",
             q(p.pacing_mode.name()),
             p.multiplier,
-            p.flow_scale,
+            if p.flow_auto {
+                q("auto")
+            } else {
+                format!("{:?}", p.flow_scale)
+            },
             p.performance_mode,
             p.override_present_mode,
             p.preserve_swapchain_image_count,
@@ -760,6 +788,29 @@ mod tests {
     }
 
     #[test]
+    fn auto_flow_scale_follows_the_source_height() {
+        let e = env(&[("LSFGM_ENV", "1"), ("LSFGM_FLOW_SCALE", "Auto")]);
+        let p = load_with(&e).unwrap().profiles[0].clone();
+        assert!(p.flow_auto);
+        assert_eq!(p.flow_for(1080), 1.0);
+        assert_eq!(p.flow_for(1440), 0.75);
+        assert_eq!(p.flow_for(2160), 0.5);
+        assert_eq!(p.flow_for(720), 1.0);
+        assert_eq!(p.flow_for(8640), 0.25);
+        // a set value is used as it is
+        let fixed = Profile {
+            flow_scale: 0.8,
+            ..Default::default()
+        };
+        assert_eq!(fixed.flow_for(2160), 0.8);
+        // toml accepts "auto" and writes it back
+        let cfg = parse("version = 2\n[global]\n[[profile]]\nname = \"p\"\nflow_scale = \"auto\"\n", &env(&[])).unwrap();
+        assert!(cfg.profiles[0].flow_auto);
+        assert_eq!(parse(&to_toml(&cfg), &env(&[])).unwrap(), cfg);
+        assert!(load_with(&env(&[("LSFGM_ENV", "1"), ("LSFGM_FLOW_SCALE", "0")])).is_err());
+    }
+
+    #[test]
     fn env_mode_defaults_and_empty_values() {
         let e = env(&[
             ("LSFGM_ENV", "1"),
@@ -816,11 +867,11 @@ mod tests {
         );
         assert_eq!(
             err(&[("LSFGM_FLOW_SCALE", "0.2")]),
-            "LSFGM_FLOW_SCALE must be between 0.25 and 1.0"
+            "LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto"
         );
         assert_eq!(
             err(&[("LSFGM_FLOW_SCALE", "junk")]),
-            "LSFGM_FLOW_SCALE must be between 0.25 and 1.0"
+            "LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto"
         );
         assert_eq!(
             err(&[("LSFGM_PACING_MODE", "Bogus")]),
@@ -995,7 +1046,7 @@ mod tests {
         );
         assert_eq!(
             err("version = 2\n[global]\n[[profile]]\nname = \"p\"\nflow_scale = 1.5\n"),
-            "Profile 'p' has flow_scale out of range (must be between 0.25 and 1.0)"
+            "Profile 'p' has flow_scale out of range (must be between 0.25 and 1.0, or \"auto\")"
         );
         // multiplier 1 is valid in a file
         assert_eq!(

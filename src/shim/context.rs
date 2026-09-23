@@ -38,7 +38,7 @@ impl Wrapper {
             inst.clone(),
             w,
             h,
-            profile.flow_scale,
+            profile.flow_for(h),
             profile.performance_mode,
             hdr,
         )?;
@@ -53,7 +53,7 @@ impl Wrapper {
             sync,
             fence,
             extent: (w, h),
-            built: (profile.flow_scale, profile.performance_mode),
+            built: (profile.flow_for(h), profile.performance_mode),
             iteration: 0,
             remaining: 0,
             sync_counter: 0,
@@ -64,7 +64,7 @@ impl Wrapper {
 
     // true when a reloaded profile changes something the pipeline was built from
     pub fn stale(&self, profile: &Profile) -> bool {
-        self.built != (profile.flow_scale, profile.performance_mode)
+        self.built != (profile.flow_for(self.extent.1), profile.performance_mode)
     }
 
     fn submit(

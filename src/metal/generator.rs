@@ -1004,14 +1004,15 @@ impl Worker {
             format!("multiplier {m}")
         };
         log::info(&format!(
-            "Metal presentation {w}x{h} ({format:?}), {mode}, display {} Hz",
-            (1.0 / self.refresh).round()
+            "Metal presentation {w}x{h} ({format:?}), {mode}, display {} Hz, flow {:.2}",
+            (1.0 / self.refresh).round(),
+            p.flow_for(h)
         ));
         let b = self.backend.as_ref().ok_or("backend missing")?;
         self.ctx = Some(Wrapper::new(
             b,
             (w, h),
-            p.flow_scale,
+            p.flow_for(h),
             p.performance_mode,
             format == vk::Format::R16G16B16A16_SFLOAT,
         )?);
