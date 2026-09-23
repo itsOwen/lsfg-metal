@@ -45,7 +45,7 @@ Three hooks cover the renderers a Wine bottle can use:
 * Performance mode (the performance shader set) and flow scale 0.25 to 1.0.
 * SDR formats: single-layer 8-bit RGBA8/BGRA8 (unorm or sRGB), 10-bit `A2B10G10R10` /
   `A2R10G10B10` (what Unreal Engine games present) and, on the Vulkan path, `R16G16B16A16_SFLOAT`
-  in sRGB. On the Metal path: BGRA8/RGBA8 and `RGB10A2Unorm` layers.
+  in sRGB. On the Metal path: BGRA8/RGBA8, `RGB10A2Unorm` and `BGR10A2Unorm` layers.
 * HDR: linear scRGB, Vulkan `R16G16B16A16_SFLOAT` with `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
   and `CAMetalLayer`s in `RGBA16Float` with `kCGColorSpaceExtendedLinearSRGB`. On the Vulkan path
   also HDR10: 10-bit with `VK_COLOR_SPACE_HDR10_ST2084_EXT`.
@@ -501,8 +501,8 @@ fixed path. Leave the variable unset to avoid timestamp and callback overhead.
 
 **`LSFGM_METAL_DUMP=<dir>`.** On the Metal path, source frame 89 is written as `<dir>/previous`,
 source frame 90 as `<dir>/original`, and each generated frame of frame 90 as `<dir>/generated<i>`.
-Format is PPM (`P6 <w> <h> 255\n` then RGB bytes, B and R swapped for BGRA formats, `RGB10A2Unorm`
-reduced to 8 bits per channel, alpha dropped),
+Format is PPM (`P6 <w> <h> 255\n` then RGB bytes, B and R swapped for BGRA and `BGR10A2Unorm`,
+10-bit formats reduced to 8 bits per channel, alpha dropped),
 or PFM for `RGBA16Float` (`PF\n<w> <h>\n-1.0\n` then bottom-to-top RGB float32 rows). With the
 `mtlclear` smoke test, whose white square moves 8 px per frame, the generated frames must show the
 square at intermediate positions. That is the check that the output is interpolation and not a copy.

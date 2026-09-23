@@ -1248,14 +1248,21 @@ impl Worker {
         } else {
             let bgra = matches!(
                 format,
-                MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB
+                MTLPixelFormat::BGRA8Unorm
+                    | MTLPixelFormat::BGRA8Unorm_sRGB
+                    | MTLPixelFormat::BGR10A2Unorm
             );
-            let packed = format == MTLPixelFormat::RGB10A2Unorm;
+            let packed = matches!(
+                format,
+                MTLPixelFormat::RGB10A2Unorm | MTLPixelFormat::BGR10A2Unorm
+            );
             out.extend_from_slice(format!("P6 {w} {h} 255\n").as_bytes());
             for p in px.chunks_exact(4) {
-                // rgb10a2 is one little-endian word, red in the low ten bits
+                // 10-bit is one little-endian word, red in the low ten bits (blue for bgr10a2)
                 let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-                out.extend_from_slice(&if packed {
+                out.extend_from_slice(&if packed && bgra {
+                    [(v >> 22) as u8, (v >> 12) as u8, (v >> 2) as u8]
+                } else if packed {
                     [(v >> 2) as u8, (v >> 12) as u8, (v >> 22) as u8]
                 } else if bgra {
                     [p[2], p[1], p[0]]

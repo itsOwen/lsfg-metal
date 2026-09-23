@@ -86,6 +86,7 @@ pub(crate) fn vk_format(f: MTLPixelFormat) -> Result<vk::Format, String> {
         MTLPixelFormat::RGBA8Unorm_sRGB => vk::Format::R8G8B8A8_SRGB,
         MTLPixelFormat::RGBA16Float => vk::Format::R16G16B16A16_SFLOAT,
         MTLPixelFormat::RGB10A2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        MTLPixelFormat::BGR10A2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         other => return Err(format!("unsupported drawable pixel format {}", other.0)),
     })
 }

@@ -231,7 +231,8 @@ fn format_supported(layer: &CAMetalLayer) -> bool {
         | MTLPixelFormat::BGRA8Unorm_sRGB
         | MTLPixelFormat::RGBA8Unorm
         | MTLPixelFormat::RGBA8Unorm_sRGB
-        | MTLPixelFormat::RGB10A2Unorm => true,
+        | MTLPixelFormat::RGB10A2Unorm
+        | MTLPixelFormat::BGR10A2Unorm => true,
         MTLPixelFormat::RGBA16Float => {
             let name = CGColorSpace::name(layer.colorspace().as_deref()).map(|n| n.to_string());
             name.as_deref() == Some(&unsafe { kCGColorSpaceExtendedLinearSRGB }.to_string())
