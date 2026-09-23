@@ -123,6 +123,14 @@ pub enum Binding {
     Sampled(Vec<usize>),
 }
 
+// one dispatch: (sub-iteration, groups, special)
+pub type Dispatch = (u32, (u32, u32), bool);
+
+pub struct StageTab {
+    // (shader, dispatches) runs
+    pub subs: Vec<(usize, Vec<Dispatch>)>,
+}
+
 pub struct Signature {
     pub perf: bool,
     pub images: Vec<Image>,
@@ -394,6 +402,37 @@ impl Signature {
         }
     }
 
+    // the dispatches of every stage at this size, consecutive passes of one shader grouped
+    pub fn tabs(&self, w: u32, h: u32, flow: f32) -> Vec<StageTab> {
+        self.stages
+            .iter()
+            .map(|stage| {
+                let mut subs: Vec<(usize, Vec<Dispatch>)> = vec![];
+                for &p in stage {
+                    let pass = &self.passes[p];
+                    let entry = (
+                        self.subiter[p],
+                        pass.rule.eval(w, h, flow),
+                        pass.flags & SPECIAL != 0,
+                    );
+                    match subs.last_mut() {
+                        Some((sh, v)) if *sh == pass.shader => v.push(entry),
+                        _ => subs.push((pass.shader, vec![entry])),
+                    }
+                }
+                StageTab { subs }
+            })
+            .collect()
+    }
+
+    // false when a pass would get an empty grid, so later passes would read texels nothing wrote
+    pub fn fits(&self, w: u32, h: u32, flow: f32) -> bool {
+        self.passes.iter().all(|p| {
+            let (x, y) = p.rule.eval(w, h, flow);
+            x > 0 && y > 0
+        })
+    }
+
     // descriptor count of a binding: images expand to their sub-images
     pub fn count(&self, b: &Binding) -> u32 {
         match b {
@@ -462,6 +501,18 @@ mod tests {
                 let read = s.passes.iter().any(|p| p.inputs.contains(&Some(i)));
                 assert!(im.is(P) || read, "image {i} never read");
             }
+        }
+    }
+
+    // the coarsest pass works on 1/128 of the flowed size, rounded, so 64 flowed pixels is the floor
+    #[test]
+    fn fits_from_64_flowed_pixels() {
+        for perf in [false, true] {
+            let s = Signature::new(perf);
+            assert!(s.fits(64, 64, 1.0) && s.fits(1920, 1080, 0.25));
+            assert!(!s.fits(63, 1080, 1.0) && !s.fits(1920, 63, 1.0));
+            assert!(s.fits(256, 256, 0.25) && !s.fits(255, 1080, 0.25));
+            assert!(!s.fits(0, 0, 1.0));
         }
     }
 }

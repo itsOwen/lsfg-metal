@@ -34,6 +34,10 @@ impl Wrapper {
         h: u32,
         hdr: bool,
     ) -> Result<Wrapper, String> {
+        let flow = profile.flow_for(h);
+        if !generator::signature::Signature::new(profile.performance_mode).fits(w, h, flow) {
+            return Err(format!("{w}x{h} is too small to generate frames for"));
+        }
         let ctx = generator::Context::new(
             inst.clone(),
             w,

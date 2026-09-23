@@ -99,16 +99,6 @@ fn cache_path(perf: bool, uuid: [u8; 16]) -> Option<PathBuf> {
     )))
 }
 
-// one dispatch: (sub-iteration, groups, special)
-type Dispatch = (u32, (u32, u32), bool);
-
-struct StageTab {
-    sampled: Vec<usize>,
-    stored: Vec<usize>,
-    // (shader, dispatches) runs
-    subs: Vec<(usize, Vec<Dispatch>)>,
-}
-
 impl Pipeline {
     pub fn new(
         inst: Arc<Instance>,
@@ -540,37 +530,7 @@ impl Pipeline {
         log(&format!("  Created {} pipelines", self.pipelines.len()));
 
         // stage tables
-        let tabs: Vec<StageTab> = self
-            .sig
-            .stages
-            .iter()
-            .map(|stage| {
-                let mut t = StageTab {
-                    sampled: vec![],
-                    stored: vec![],
-                    subs: vec![],
-                };
-                for &p in stage {
-                    let pass = &self.sig.passes[p];
-                    for &i in pass.inputs.iter().flatten() {
-                        if !t.sampled.contains(&i) {
-                            t.sampled.push(i);
-                        }
-                    }
-                    t.stored.push(pass.output);
-                    let entry = (
-                        self.sig.subiter[p],
-                        pass.rule.eval(w, h, flow),
-                        pass.flags & SPECIAL != 0,
-                    );
-                    match t.subs.last_mut() {
-                        Some((sh, v)) if *sh == pass.shader => v.push(entry),
-                        _ => t.subs.push((pass.shader, vec![entry])),
-                    }
-                }
-                t
-            })
-            .collect();
+        let tabs = self.sig.tabs(w, h, flow);
         log(&format!("  Built {} pipeline stages", tabs.len()));
         let stages = tabs.len() as u32;
         let split = self.sig.split as u32;
