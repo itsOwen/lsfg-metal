@@ -170,6 +170,8 @@ fn check_dyld(r: &mut Report) {
 
 // version and the extension the Metal paths need, from the driver itself
 fn check_driver(r: &mut Report, real: &Path) {
+    // set when the driver loads but is too old or lacks metal_objects, which limits generation on moltenvk only
+    let limited = std::cell::Cell::new(false);
     let run = || -> Result<String, String> {
         let (_lib, entry) = vkutil::load_driver(real)?;
         let instance =
@@ -177,7 +179,7 @@ fn check_driver(r: &mut Report, real: &Path) {
         let out = (|| {
             let pd = vkutil::select_physical_device(&instance, "")?;
             let gipa = entry.static_fn().get_instance_proc_addr;
-            vkutil::check_driver(gipa, instance.handle(), pd)?;
+            vkutil::check_driver(gipa, instance.handle(), pd).inspect_err(|_| limited.set(true))?;
             let exts = vkutil::check(
                 unsafe { instance.enumerate_device_extension_properties(pd) },
                 "vkEnumerateDeviceExtensionProperties",
@@ -186,7 +188,8 @@ fn check_driver(r: &mut Report, real: &Path) {
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::metal_objects::NAME));
             if !metal {
-                return Err("the driver has no VK_EXT_metal_objects, so the Metal and proxy paths cannot import textures".into());
+                limited.set(true);
+                return Err("the driver has no VK_EXT_metal_objects, so the proxy path and generation on MoltenVK cannot import textures".into());
             }
             let mut props = vk::PhysicalDeviceProperties2::default();
             unsafe { instance.get_physical_device_properties2(pd, &mut props) };
@@ -204,7 +207,17 @@ fn check_driver(r: &mut Report, real: &Path) {
         unsafe { instance.destroy_instance(None) };
         out
     };
-    r.res("driver", run());
+    // the native generator needs neither, so on apple silicon those two only limit moltenvk
+    let native = std::env::var_os("LSFGM_NATIVE").is_none_or(|v| v != "0")
+        && objc2_metal::MTLCreateSystemDefaultDevice()
+            .is_some_and(|d| objc2_metal::MTLDevice::supportsFamily(&*d, objc2_metal::MTLGPUFamily::Apple7));
+    match run() {
+        Err(e) if native && limited.get() => r.warn(
+            "driver",
+            &format!("{e}; the native Metal generator does not need it, so Metal and OpenGL games can still generate"),
+        ),
+        res => r.res("driver", res),
+    }
 }
 
 // the shader package: found, parsable, and the frame-generation build rather than the DXBC one
