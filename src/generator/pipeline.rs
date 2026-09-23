@@ -545,7 +545,13 @@ impl Pipeline {
                 n.join(" ")
             })
             .collect();
-        if std::env::var_os("LSFGM_GPU_PROFILE").is_some() {
+        let bits = || {
+            let families = unsafe { inst.instance.get_physical_device_queue_family_properties(pd) };
+            families.get(inst.family as usize).map_or(0, |f| f.timestamp_valid_bits)
+        };
+        if std::env::var_os("LSFGM_GPU_PROFILE").is_some() && bits() == 0 {
+            crate::log::warn("LSFGM_GPU_PROFILE ignored: this queue has no GPU timestamps");
+        } else if std::env::var_os("LSFGM_GPU_PROFILE").is_some() {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
                 .query_count(stages + 2);
