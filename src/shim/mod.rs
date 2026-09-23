@@ -353,6 +353,9 @@ impl Layer {
         s.profile = i;
         s.revision += 1;
         log::set_level(level(cfg.log_level));
+        if let Some(f) = cfg.log_file.as_ref().filter(|f| Some(*f) != s.config.log_file.as_ref()) {
+            log::set_file(f);
+        }
         s.config = cfg;
         Ok(true)
     }
