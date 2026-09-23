@@ -307,7 +307,9 @@ impl Generator {
                 .name("lsfg-metal".into())
                 .spawn(move || {
                     // presents are on the display's deadline: user-interactive qos keeps the worker off the efficiency cores
-                    unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+                    if unsafe { pthread_set_qos_class_self_np(0x21, 0) } != 0 {
+                        log::warn("Metal presentation worker could not get user-interactive qos");
+                    }
                     autoreleasepool(|_| Worker::new(self)).run(rx)
                 });
             if let Err(e) = spawned {
