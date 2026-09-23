@@ -245,6 +245,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_LATENCY` | Metal presentation latency, p50/p95 every 120 callbacks per frame kind | read by **presence** | unset |
 | `LSFGM_PACE_DEBUG` | per-frame estimator log line | read by **presence** | unset |
 | `LSFGM_METAL_DUMP` | frame dump directory (Metal path) | directory path | unset |
+| `LSFGM_GPU_PROFILE` | GPU timestamps around every generator stage, printed by `validate` | read by **presence** | unset |
 | `LSFGM_CONFIG` | configuration file path, used verbatim and highest precedence | path; must exist or loading fails | unset |
 | `LSFGM_PROFILE` | select a profile by exact name | profile name | unset |
 | `LSFGM_DISABLE` | turn the shim off for this process: no profile, no swizzles, every path passes through | read by **presence**, any value including empty | unset |
@@ -622,6 +623,12 @@ interpolation regression a `cmp` against a golden directory. The readback and th
 inside the timed section, so ignore the milliseconds when `--out` is used. Binary (P6) 8-bit PPM only, so `--in`
 and `--hdr` are mutually exclusive. For a 40-pixel square moved 120 pixels between the two inputs,
 `-m 4` writes it at +30, +60 and +90.
+
+With `LSFGM_GPU_PROFILE` set, a normal (not `--bench`) run also prints the GPU time of every stage,
+averaged over the iterations after the fifth, then the pre-pass and main pass totals. The timestamps
+sit on the barriers between stages, where the encoder ends, so they measure each stage as it runs.
+Reading them waits for the GPU after every iteration, so the milliseconds-per-frame line of a
+profiled run is not comparable with an unprofiled one.
 
 **`doctor`.** Checks an install without launching a game. Every check prints one `ok`, `warn` or
 `FAIL` line; exit 1 if any check failed, 0 otherwise, so a `warn` alone still exits 0.

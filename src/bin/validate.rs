@@ -270,6 +270,7 @@ fn run() -> Result<(), String> {
 
     let mut s = 0u64;
     let t1 = Instant::now();
+    let (mut profile, mut profiled) = (Vec::<f64>::new(), 0u32);
     for it in 0..iters {
         // synthetic input: a solid colour that swings between red and blue, written into layer iteration % 2
         let cb = vkutil::allocate_command_buffer(d, pool)?;
@@ -354,6 +355,15 @@ fn run() -> Result<(), String> {
         if !bench {
             s += 2 * (m as u64 - 1);
         }
+        // LSFGM_GPU_PROFILE: stage times of this iteration, after a warm-up; bench iterations overlap on the queries
+        if let Some(t) = (!bench && it >= 5)
+            .then(|| ctx.pipeline.gpu_profile())
+            .flatten()
+        {
+            profile.resize(t.len(), 0.0);
+            profile.iter_mut().zip(&t).for_each(|(a, b)| *a += b);
+            profiled += 1;
+        }
     }
     ctx.idle()?;
     check(unsafe { d.queue_wait_idle(inst.queue) }, "vkQueueWaitIdle")?;
@@ -422,6 +432,20 @@ fn run() -> Result<(), String> {
         run.as_secs_f64() * 1e3 / frames as f64,
         pixel
     );
+    if profiled > 0 {
+        let split = ctx.pipeline.sig.split;
+        let (mut pre, mut main) = (0.0, 0.0);
+        for (st, (t, label)) in profile.iter().zip(&ctx.pipeline.stage_labels).enumerate() {
+            let t = t / profiled as f64;
+            if st < split {
+                pre += t;
+            } else {
+                main += t;
+            }
+            println!("stage {st:2} {:5.3} ms  {label}", t);
+        }
+        println!("pre-pass {pre:.3} ms, main pass {main:.3} ms ({profiled} iterations)");
+    }
     drop(ctx);
     Ok(())
 }
