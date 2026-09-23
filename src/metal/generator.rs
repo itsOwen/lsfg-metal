@@ -4,7 +4,7 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, SendError, Sender};
+use std::sync::mpsc::{channel, Receiver, SendError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::Message;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable, MTLEvent, MTLOrigin, MTLPixelFormat,
+    MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable, MTLEvent, MTLGPUFamily, MTLOrigin, MTLPixelFormat,
     MTLResourceOptions, MTLSharedEvent, MTLSharedEventListener, MTLSize, MTLStorageMode,
     MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
@@ -24,10 +24,12 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use super::drawable::ProxyDrawable;
 use super::latency;
 use super::{enabled, hooks, set_enabled, setup, vk_format, Setup};
-use crate::generator::{Context, Instance};
+use crate::generator::signature::Signature;
+use crate::generator::{native, Context, Instance};
 use crate::log;
 use crate::pacer::{display_refresh, Estimator, Pacer, Sample};
 use crate::settings::PacingMode;
+use crate::shaders;
 use crate::vkutil::{self, check};
 
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
@@ -822,11 +824,168 @@ impl Wrapper {
     }
 }
 
+// ---- native generator on the layer's own device ----
+
+// the dll's spir-v, read once for every layer
+fn spirv(dll: &Path) -> Result<&'static HashMap<u32, Vec<u32>>, String> {
+    static SPIRV: OnceLock<Result<HashMap<u32, Vec<u32>>, String>> = OnceLock::new();
+    SPIRV
+        .get_or_init(|| shaders::parse(&std::fs::read(dll).map_err(|e| format!("{}: {e}", dll.display()))?))
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+// LSFGM_NATIVE=0 keeps generation on moltenvk
+pub(super) fn native_off() -> bool {
+    std::env::var_os("LSFGM_NATIVE").is_some_and(|v| v == "0")
+}
+
+pub(super) struct Native {
+    pub(super) pipeline: native::Pipeline,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    // iteration of the frame in flight and the next one, as the vulkan context counts them
+    pub(super) iteration: u32,
+    next: u32,
+    // the block keeps the last main pass's timestamp until the next one, so the pre-pass sees it too
+    pub(super) timestamp: f32,
+    generated: bool,
+    // the last command buffer committed; the queue is in order, so it completing means the frame is done
+    pub(super) last: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+}
+
+impl Native {
+    pub(super) fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        setup: &Setup,
+        extent: (u32, u32),
+        hdr: bool,
+    ) -> Result<Native, String> {
+        // only tested on apple silicon; intel and amd gpus stay on moltenvk
+        if !device.supportsFamily(MTLGPUFamily::Apple7) {
+            return Err("not an Apple silicon GPU".into());
+        }
+        let p = &setup.profile;
+        let queue = device.newCommandQueue().ok_or("no Metal command queue")?;
+        let pipeline = native::Pipeline::new(
+            device,
+            spirv(&setup.dll)?,
+            setup.allow_fp16,
+            extent,
+            p.flow_for(extent.1),
+            p.performance_mode,
+            hdr,
+            log::debug,
+        )?;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| log::info("Frame generation runs natively on Metal"));
+        Ok(Native {
+            pipeline,
+            queue,
+            iteration: 0,
+            next: 0,
+            timestamp: 0.0,
+            generated: false,
+            last: None,
+        })
+    }
+
+    pub(super) fn cb(&self) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+        self.queue.commandBuffer().ok_or_else(|| "no Metal command buffer".into())
+    }
+
+    pub(super) fn commit(&mut self, cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
+        cb.commit();
+        self.last = Some(cb);
+    }
+
+    // a new iteration: the next source layer and a main pass still to run
+    pub(super) fn begin(&mut self) {
+        (self.iteration, self.next, self.generated) = (self.next, self.next + 1, false);
+    }
+
+    // wait for everything committed so far
+    pub(super) fn settle(&mut self) -> Result<(), String> {
+        match self.last.take() {
+            Some(cb) if !wait_completed(&cb) => Err("Metal frame did not complete".into()),
+            Some(cb) if cb.status() == MTLCommandBufferStatus::Error => Err(format!(
+                "Metal frame failed: {}",
+                cb.error().map_or("unknown error".into(), |e| e.localizedDescription().to_string())
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    // generated frame into `target`, running the main pass first if it has not run
+    pub(super) fn produce(
+        &mut self,
+        target: &ProtocolObject<dyn MTLTexture>,
+        ts: f64,
+        signal: Option<(&ProtocolObject<dyn MTLEvent>, u64)>,
+    ) -> Result<(), String> {
+        self.main_pass(ts)?;
+        let cb = self.cb()?;
+        self.pipeline.copy_out(&cb, target)?;
+        if let Some((e, v)) = signal {
+            cb.encodeSignalEvent_value(e, v);
+        }
+        self.commit(cb);
+        self.generated = false;
+        Ok(())
+    }
+
+    pub(super) fn main_pass(&mut self, ts: f64) -> Result<(), String> {
+        if !self.generated {
+            self.timestamp = ts as f32;
+            let cb = self.cb()?;
+            self.pipeline.encode(&cb, true, self.iteration, self.timestamp)?;
+            self.commit(cb);
+            self.generated = true;
+        }
+        Ok(())
+    }
+}
+
+// srgb drawables go through a unorm view, so copies move the encoded bytes instead of converting them
+fn unorm_view(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Texture, &'static str> {
+    let unorm = match texture.pixelFormat() {
+        MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
+        MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
+        _ => None,
+    };
+    match unorm {
+        Some(f) => texture
+            .newTextureViewWithPixelFormat(f)
+            .ok_or("could not create a unorm view of an srgb drawable"),
+        None => Ok(texture.retain()),
+    }
+}
+
 // ---- worker ----
 
 enum Fail {
+    // this frame shows as it is, and the context stays
+    Skip(String),
     Mismatch(String),
     Error(String),
+}
+
+// metal devices and the objects a native generator holds are thread-safe; each moves to one thread
+pub(super) struct Unshared<T>(pub(super) T);
+unsafe impl<T> Send for Unshared<T> {}
+
+impl<T> Unshared<T> {
+    pub(super) fn get(self) -> T {
+        self.0
+    }
+}
+
+// the result of a native build on its own thread
+pub(super) type Built = Receiver<Result<Unshared<Native>, String>>;
+
+// a native generator being built for this source size and format
+struct Pending {
+    key: ((u32, u32), MTLPixelFormat),
+    rx: Built,
 }
 
 impl From<String> for Fail {
@@ -860,6 +1019,11 @@ struct Worker {
     setup: &'static Setup,
     backend: Option<Backend>,
     ctx: Option<Wrapper>,
+    // the native generator; moltenvk runs instead when LSFGM_NATIVE=0 or the native one cannot be built
+    native: Option<Native>,
+    native_off: bool,
+    pending: Option<Pending>,
+    views: HashMap<usize, Texture>,
     pacer: Option<Pacer>,
     extent: (u32, u32),
     format: vk::Format,
@@ -891,6 +1055,10 @@ impl Worker {
             setup: setup().expect("worker without a profile"),
             backend: None,
             ctx: None,
+            native: None,
+            native_off: native_off(),
+            pending: None,
+            views: HashMap::new(),
             pacer: None,
             extent: (0, 0),
             format: vk::Format::UNDEFINED,
@@ -929,6 +1097,7 @@ impl Worker {
     }
 
     fn forget(&mut self, key: usize) {
+        self.views.remove(&key);
         if let (Some(i), Some(b)) = (self.imports.remove(&key), &self.backend) {
             unsafe {
                 b.device.destroy_image(i.image, None);
@@ -947,6 +1116,10 @@ impl Worker {
         }
         match self.generate(job) {
             Ok(()) => {}
+            Err(Fail::Skip(what)) => {
+                log::log_fmt(log::Level::Debug, format_args!("Metal frame shown as it is: {what}"));
+                self.present_natively(job);
+            }
             Err(Fail::Mismatch(what)) => {
                 log::log_fmt(log::Level::Debug, format_args!("Metal frame skipped: {what}"));
                 self.reset();
@@ -967,10 +1140,15 @@ impl Worker {
         if let (Some(c), Some(b)) = (self.ctx.take(), &self.backend) {
             c.destroy(b);
         }
+        if let Some(mut n) = self.native.take() {
+            let _ = n.settle();
+        }
         let keys: Vec<_> = self.imports.keys().copied().collect();
         for k in keys {
             self.forget(k);
         }
+        // each view holds its drawable, so old-size ones would live on
+        self.views.clear();
         self.extent = (0, 0);
     }
 
@@ -986,16 +1164,84 @@ impl Worker {
     fn prepare(&mut self, texture: &ProtocolObject<dyn MTLTexture>) -> Result<(), Fail> {
         let (w, h) = (texture.width() as u32, texture.height() as u32);
         let format = vk_format(texture.pixelFormat())?;
-        if self.ctx.is_some()
+        if (self.ctx.is_some() || self.native.is_some())
             && (w, h) == self.extent
             && texture.pixelFormat() == self.pixel_format
         {
             return Ok(());
         }
+        let key = ((w, h), texture.pixelFormat());
+        let hdr = format == vk::Format::R16G16B16A16_SFLOAT;
+        if !self.native_off {
+            // the native build runs off the worker, so the game never waits on it; its frames show as they are meanwhile
+            match self.pending.as_ref().filter(|p| p.key == key).map(|p| p.rx.try_recv()) {
+                Some(Err(TryRecvError::Empty)) => return Err(Fail::Skip("native generator still building".into())),
+                Some(Ok(Ok(n))) => {
+                    self.pending = None;
+                    self.reset();
+                    self.announce(texture);
+                    self.native = Some(n.0);
+                    (self.extent, self.format, self.pixel_format) = ((w, h), format, texture.pixelFormat());
+                    return Ok(());
+                }
+                Some(result) => {
+                    self.pending = None;
+                    let e = match result {
+                        Ok(Err(e)) => e,
+                        _ => "the build thread ended".into(),
+                    };
+                    log::warn(&format!("Native Metal generator unavailable ({e}); using MoltenVK"));
+                    self.native_off = true;
+                }
+                None => {
+                    self.reset();
+                    let p = &self.setup.profile;
+                    if !Signature::new(p.performance_mode).fits(w, h, p.flow_for(h)) {
+                        return Err(Fail::Mismatch(format!("{w}x{h} is too small to generate frames for")));
+                    }
+                    let (tx, rx) = channel();
+                    let (device, setup) = (Unshared(self.gen.device.clone()), self.setup);
+                    std::thread::Builder::new()
+                        .name("lsfg-metal native build".into())
+                        .spawn(move || {
+                            let device = device.get();
+                            let built = autoreleasepool(|_| Native::new(&device, setup, (w, h), hdr));
+                            let _ = tx.send(built.map(Unshared));
+                        })
+                        .map_err(|e| format!("no thread for the native build: {e}"))?;
+                    self.pending = Some(Pending { key, rx });
+                    return Err(Fail::Skip("native generator building".into()));
+                }
+            }
+        }
         self.reset();
+        let p = &self.setup.profile;
+        if !Signature::new(p.performance_mode).fits(w, h, p.flow_for(h)) {
+            return Err(Fail::Mismatch(format!("{w}x{h} is too small to generate frames for")));
+        }
+        self.announce(texture);
+        self.backend()?;
+        let b = self.backend.as_ref().ok_or("backend missing")?;
+        self.ctx = Some(Wrapper::new(b, (w, h), p.flow_for(h), p.performance_mode, hdr)?);
+        if self.sems.is_none() {
+            let game = import_event(&b.device, &self.gen.game_event)?;
+            let present = import_event(&b.device, &self.gen.present_event)?;
+            self.sems = Some((game, present, vkutil::create_fence(&b.device)?));
+        }
+        while self.cmd.len() < p.multiplier as usize + 2 {
+            self.cmd
+                .push(vkutil::allocate_command_buffer(&b.device, b.pool)?);
+        }
+        (self.extent, self.format, self.pixel_format) = ((w, h), format, texture.pixelFormat());
+        Ok(())
+    }
+
+    // the display rate and pacer for a new context, and its log line
+    fn announce(&mut self, texture: &ProtocolObject<dyn MTLTexture>) {
+        let (w, h) = (texture.width() as u32, texture.height() as u32);
+        let p = &self.setup.profile;
         // the window may have moved to another display, or the mode changed, since the last build
         self.refresh = autoreleasepool(|_| display_refresh());
-        let p = &self.setup.profile;
         let m = p.multiplier;
         let adaptive = p.pacing_mode == PacingMode::Adaptive;
         let mode = if adaptive {
@@ -1004,32 +1250,34 @@ impl Worker {
             format!("multiplier {m}")
         };
         log::info(&format!(
-            "Metal presentation {w}x{h} ({format:?}), {mode}, display {} Hz, flow {:.2}",
+            "Metal presentation {w}x{h} ({:?}{}), {mode}, display {} Hz, flow {:.2}",
+            vk_format(texture.pixelFormat()).unwrap_or(vk::Format::UNDEFINED),
+            match texture.pixelFormat() {
+                MTLPixelFormat::BGRA8Unorm_sRGB | MTLPixelFormat::RGBA8Unorm_sRGB => " srgb",
+                _ => "",
+            },
             (1.0 / self.refresh).round(),
             p.flow_for(h)
         ));
-        let b = self.backend.as_ref().ok_or("backend missing")?;
-        self.ctx = Some(Wrapper::new(
-            b,
-            (w, h),
-            p.flow_for(h),
-            p.performance_mode,
-            format == vk::Format::R16G16B16A16_SFLOAT,
-        )?);
         self.pacer = adaptive.then(|| Pacer::new(self.refresh, m));
-        if self.sems.is_none() {
-            let game = import_event(&b.device, &self.gen.game_event)?;
-            let present = import_event(&b.device, &self.gen.present_event)?;
-            self.sems = Some((game, present, vkutil::create_fence(&b.device)?));
+    }
+
+    // cached view of a drawable for the native generator
+    fn view(&mut self, texture: &ProtocolObject<dyn MTLTexture>) -> Result<Texture, Fail> {
+        let key = texture as *const _ as usize;
+        if let Some(v) = self.views.get(&key) {
+            return Ok(v.clone());
         }
-        while self.cmd.len() < m as usize + 2 {
-            self.cmd
-                .push(vkutil::allocate_command_buffer(&b.device, b.pool)?);
+        if (texture.width() as u32, texture.height() as u32) != self.extent
+            || vk_format(texture.pixelFormat()).ok() != Some(self.format)
+        {
+            return Err(Fail::Mismatch(
+                "drawable does not match the layer it came from".into(),
+            ));
         }
-        self.extent = (w, h);
-        self.format = format;
-        self.pixel_format = texture.pixelFormat();
-        Ok(())
+        let v = unorm_view(texture)?;
+        self.views.insert(key, v.clone());
+        Ok(v)
     }
 
     // cached texture import on the backend
@@ -1052,17 +1300,7 @@ impl Worker {
             vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
         );
         // moltenvk samples the texture as it is, so an srgb one would be linearised by the swizzling blits
-        let unorm = match texture.pixelFormat() {
-            MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
-            MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
-            _ => None,
-        };
-        let view = match unorm {
-            Some(f) => texture
-                .newTextureViewWithPixelFormat(f)
-                .ok_or("could not create a unorm view of an srgb drawable")?,
-            None => texture.retain(),
-        };
+        let view = unorm_view(texture)?;
         let image = import_texture(&b.device, &view, info)?;
         self.imports.insert(
             key,
@@ -1202,8 +1440,11 @@ impl Worker {
         hooks::original_next_drawable(&self.gen.layer).ok_or_else(|| Fail::Mismatch(what.into()))
     }
 
-    fn generate(&mut self, job: &mut Job) -> Result<(), Fail> {
-        self.backend()?;
+    // wait for the previous frame before its context is reused
+    fn settle(&mut self) -> Result<(), Fail> {
+        if let Some(n) = &mut self.native {
+            n.settle()?;
+        }
         if self.frame_pending {
             let (_, _, fence) = self.sems.unwrap();
             let d = &self.backend.as_ref().unwrap().device;
@@ -1212,7 +1453,123 @@ impl Worker {
             check(unsafe { d.reset_fences(&[fence]) }, "vkResetFences")?;
             self.frame_pending = false;
         }
+        Ok(())
+    }
+
+    // the game's frame into the source and the pre-pass; returns the present value that marks it copied
+    fn start(
+        &mut self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        serial: u64,
+        inserted: u32,
+    ) -> Result<u64, Fail> {
+        if self.native.is_some() {
+            let view = self.view(texture)?;
+            let copied = self.next_serial();
+            let gen = self.gen;
+            let n = self.native.as_mut().unwrap();
+            n.begin();
+            let cb = n.cb()?;
+            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*gen.game_event), serial);
+            n.pipeline.copy_in(&cb, &view, n.iteration % 2)?;
+            // signalled once the copy is done, as on moltenvk, so the game's drawable goes back before the pre-pass
+            cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*gen.present_event), copied);
+            n.pipeline.encode(&cb, false, n.iteration, n.timestamp)?;
+            n.commit(cb);
+            return Ok(copied);
+        }
+        let source = self.imported(texture)?;
+        let (game_sem, present, _) = self.sems.unwrap();
+        let copied = self.next_serial();
+        let b = self.backend.as_ref().unwrap();
+        self.ctx.as_mut().unwrap().dispatch(
+            b,
+            self.cmd[0],
+            source,
+            (game_sem, serial),
+            inserted,
+            (present, copied),
+        )?;
+        Ok(copied)
+    }
+
+    // the main pass, submitted before the drawable is waited for
+    fn early(&mut self, slot: f64) -> Result<(), Fail> {
+        match &mut self.native {
+            Some(n) => n.main_pass(slot)?,
+            None => self.ctx.as_mut().unwrap().generate(slot)?,
+        }
+        Ok(())
+    }
+
+    // generated frame i into the target; returns its present value
+    fn produce(
+        &mut self,
+        target: &ProtocolObject<dyn MTLTexture>,
+        i: usize,
+        slot: f64,
+        last: bool,
+    ) -> Result<u64, Fail> {
+        if self.native.is_some() {
+            let view = self.view(target)?;
+            let ready = self.next_serial();
+            let gen = self.gen;
+            let event = ProtocolObject::from_ref(&*gen.present_event);
+            self.native.as_mut().unwrap().produce(&view, slot, Some((event, ready)))?;
+            return Ok(ready);
+        }
+        let timg = self.imported(target)?;
+        let ready = self.next_serial();
+        let (_, present, fence) = self.sems.unwrap();
+        let (b, cb) = (self.backend.as_ref().unwrap(), self.cmd[1 + i]);
+        let completion = if last { fence } else { vk::Fence::null() };
+        self.ctx
+            .as_mut()
+            .unwrap()
+            .acquire(b, cb, timg, slot, (present, ready), completion)?;
+        self.frame_pending |= last;
+        Ok(ready)
+    }
+
+    // the game's own frame into the target; returns its present value
+    fn original(
+        &mut self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        target: &ProtocolObject<dyn MTLTexture>,
+        inserted: usize,
+    ) -> Result<u64, Fail> {
+        if self.native.is_some() {
+            // unorm views on both sides, so a layer that switched srgb-ness still copies the bytes
+            let (src, dst) = (self.view(texture)?, self.view(target)?);
+            let ready = self.next_serial();
+            let gen = self.gen;
+            let n = self.native.as_mut().unwrap();
+            let cb = n.cb()?;
+            let blit = cb.blitCommandEncoder().ok_or("no Metal blit encoder")?;
+            unsafe { blit.copyFromTexture_toTexture(&src, &dst) };
+            blit.endEncoding();
+            cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*gen.present_event), ready);
+            n.commit(cb);
+            return Ok(ready);
+        }
+        let source = self.imported(texture)?;
+        let timg = self.imported(target)?;
+        let ready = self.next_serial();
+        let (_, present, fence) = self.sems.unwrap();
+        self.copy(self.cmd[1 + inserted], source, timg, (present, ready), fence)?;
+        self.frame_pending = true;
+        Ok(ready)
+    }
+
+    fn generate(&mut self, job: &mut Job) -> Result<(), Fail> {
+        self.settle()?;
         let texture = job.drawable.texture().retain();
+        // drawn before a resize: the layer already hands out drawables of the new size, so keep the context for now
+        let size = self.gen.layer.drawableSize();
+        let near = |v: usize, f: f64| v == f as usize || v == f.round() as usize;
+        if !near(texture.width(), size.width) || !near(texture.height(), size.height) {
+            return Err(Fail::Skip("the frame is from before a resize".into()));
+        }
         self.prepare(&texture)?;
         if job.serial == 0 {
             if let Some(cb) = &job.cb {
@@ -1284,18 +1641,7 @@ impl Worker {
         } else {
             0.0
         };
-        let source = self.imported(&texture)?;
-        let (game_sem, present, fence) = self.sems.unwrap();
-        let copied = self.next_serial();
-        let b = self.backend.as_ref().unwrap();
-        self.ctx.as_mut().unwrap().dispatch(
-            b,
-            self.cmd[0],
-            source,
-            (game_sem, job.serial),
-            inserted as u32,
-            (present, copied),
-        )?;
+        let copied = self.start(&texture, job.serial, inserted as u32)?;
         if self.stats.source == 89 {
             self.dump(&texture, "previous", copied);
         }
@@ -1303,7 +1649,7 @@ impl Worker {
             self.dump(&texture, "original", copied);
         }
         for (i, &slot) in slots.iter().take(inserted).enumerate() {
-            self.ctx.as_mut().unwrap().generate(slot)?;
+            self.early(slot)?;
             let acquire_start = job.latency.clock();
             let waited = super::now();
             let target = self.next_real("no drawable for a generated frame")?;
@@ -1312,19 +1658,7 @@ impl Worker {
                 self.gen.governor.lock().unwrap().wait(super::now() - waited);
             }
             let ttex = target.texture();
-            let timg = self.imported(&ttex)?;
-            let ready = self.next_serial();
-            let (b, cb) = (self.backend.as_ref().unwrap(), self.cmd[1 + i]);
-            let completion = if !show_original && i + 1 == inserted {
-                fence
-            } else {
-                vk::Fence::null()
-            };
-            self.ctx
-                .as_mut()
-                .unwrap()
-                .acquire(b, cb, timg, slot, (present, ready), completion)?;
-            self.frame_pending |= completion != vk::Fence::null();
+            let ready = self.produce(&ttex, i, slot, !show_original && i + 1 == inserted)?;
             if self.stats.source == 90 {
                 self.dump(&ttex, &format!("generated{i}"), ready);
             }
@@ -1344,10 +1678,7 @@ impl Worker {
             let acquire_start = job.latency.clock();
             let target = self.next_real("no drawable for the original frame")?;
             let acquire_ms = (job.latency.clock() - acquire_start) * 1000.0;
-            let timg = self.imported(&target.texture())?;
-            let ready = self.next_serial();
-            self.copy(self.cmd[1 + inserted], source, timg, (present, ready), fence)?;
-            self.frame_pending = true;
+            let ready = self.original(&texture, &target.texture(), inserted)?;
             forward_presented(job.drawable.clone(), &target);
             govern(self.gen, &target, job.latency.committed);
             self.gen.latency.attach(
