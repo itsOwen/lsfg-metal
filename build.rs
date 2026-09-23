@@ -1,4 +1,4 @@
-// version string: LSFGM_VERSION override, else git describe, else 0.7.1
+// version string: LSFGM_VERSION override, else git describe, else 0.8.0-beta.1
 use std::process::Command;
 
 fn git(args: &[&str]) -> Option<String> {
@@ -39,7 +39,7 @@ fn main() {
         .ok()
         .filter(|v| !v.is_empty())
         .or_else(git_version)
-        .unwrap_or_else(|| "0.7.1".into());
+        .unwrap_or_else(|| "0.8.0-beta.1".into());
     println!("cargo:rustc-env=LSFGM_VERSION={v}");
     // the shim stands in for the driver, so it carries the driver's install name (cdylib only; package.sh checks the export list)
     println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libMoltenVK.dylib");
