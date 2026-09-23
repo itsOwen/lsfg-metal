@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, SendError, Sender};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -73,11 +73,90 @@ pub struct Generator {
     started: Once,
     pool: Mutex<Pool>,
     pool_cv: Condvar,
+    governor: Mutex<Governor>,
+    // drawables the game may hold: 2 while fixed pacing locks it to the display, else 3
+    pool_cap: AtomicU32,
+    // set when a pool of two held the game up; it stays at three from then on
+    cap_released: AtomicBool,
+    // how long the game may wait on a pool of two, in nanoseconds: four display-locked intervals, since the step
+    // down from three alone waits about two while the frames already queued reach the screen
+    cap_patience: AtomicU64,
 }
 unsafe impl Send for Generator {}
 unsafe impl Sync for Generator {}
 
+impl Generator {
+    // how many frames the game may hold between acquire and display, for a caller that has waited this long;
+    // a game that needs a third one (two acquires before a present) must not wait on a pool of two for long
+    pub fn pool_cap(&self, waited: Duration) -> usize {
+        let cap = self.pool_cap.load(Ordering::Relaxed);
+        let patience = Duration::from_nanos(self.cap_patience.load(Ordering::Relaxed));
+        if cap < 3 && waited >= patience {
+            self.pool_cap.store(3, Ordering::Relaxed);
+            if !self.cap_released.swap(true, Ordering::Relaxed) {
+                log::info("Metal source waited on two drawables, going back to three");
+            }
+            return 3;
+        }
+        cap as usize
+    }
+}
+
 static GENERATORS: Mutex<Option<HashMap<usize, &'static Generator>>> = Mutex::new(None);
+
+// the game and the display run at the same rate, so a frame stuck in the present queue never drains by itself;
+// when the first generated frame keeps waiting for a drawable, one generated frame is skipped to drain it
+#[derive(Default)]
+struct Governor {
+    refresh: f64,
+    latency: Vec<f64>,
+    waits: Vec<f64>,
+    // median commit-to-display of the window before the last skip
+    before: f64,
+    backoff: u32,
+    failures: u32,
+    skip: bool,
+    backlog: f64,
+}
+
+impl Governor {
+    // one per source frame: how long its first generated frame waited for a drawable
+    fn wait(&mut self, secs: f64) {
+        // presents that never reach the screen send no latency samples to trim this
+        if self.waits.len() >= 60 {
+            self.waits.drain(..30);
+        }
+        self.waits.push(secs);
+    }
+
+    // one per shown original: commit to display
+    fn sample(&mut self, latency: f64) {
+        self.latency.push(latency);
+        if self.latency.len() < 30 {
+            return;
+        }
+        let median = |v: &mut Vec<f64>| {
+            let mut w = std::mem::take(v);
+            w.sort_unstable_by(f64::total_cmp);
+            w.get(w.len() / 2).copied().unwrap_or(0.0)
+        };
+        let (latency, wait) = (median(&mut self.latency), median(&mut self.waits));
+        if self.before > 0.0 {
+            // a skip that did not shorten the latency: wait a while, and after two stop trying
+            if latency > self.before - 0.5 * self.refresh {
+                self.failures += 1;
+                self.backoff = if self.failures >= 2 { u32::MAX } else { 60 };
+            }
+            self.before = 0.0;
+        } else if self.backoff > 0 {
+            self.backoff -= 1;
+        } else if wait > 0.4 * self.refresh {
+            self.skip = true;
+            self.backlog = wait;
+            self.before = latency;
+        }
+    }
+}
 
 impl Generator {
     // one per layer, created on demand, never freed
@@ -109,6 +188,10 @@ impl Generator {
                 next_id: 1,
             }),
             pool_cv: Condvar::new(),
+            governor: Mutex::new(Governor::default()),
+            pool_cap: AtomicU32::new(3),
+            cap_released: AtomicBool::new(false),
+            cap_patience: AtomicU64::new(0),
         }));
         map.insert(layer as *const _ as usize, g);
         Some(g)
@@ -169,18 +252,23 @@ impl Generator {
             size.height as usize,
             self.layer.pixelFormat(),
         );
+        let t0 = Instant::now();
         let mut pool = self.pool.lock().unwrap();
-        while pool.outstanding >= 3 {
+        loop {
+            let cap = self.pool_cap(t0.elapsed()) as u32;
+            if pool.outstanding < cap {
+                break;
+            }
             // like the real layer's one-second nextDrawable timeout: the caller gets a real drawable
-            let (p, r) = self.pool_cv.wait_timeout(pool, Duration::from_secs(1)).unwrap();
-            pool = p;
-            if r.timed_out() && pool.outstanding >= 3 {
-                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log::warn("Metal drawable pool exhausted (the game holds three drawables); this frame and any like it present natively");
+            let left = Duration::from_secs(1).saturating_sub(t0.elapsed());
+            if left.is_zero() {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn(&format!("Metal drawable pool exhausted (the game holds {cap} drawables); this frame and any like it present natively"));
                 }
                 return None;
             }
+            pool = self.pool_cv.wait_timeout(pool, left.min(Duration::from_millis(50))).unwrap().0;
         }
         pool.textures
             .retain(|t| t.width() == w && t.height() == h && t.pixelFormat() == format);
@@ -786,6 +874,14 @@ struct Worker {
     stats: Stats,
     stats_on: bool,
     dump_dir: Option<PathBuf>,
+    // fixed pacing: recent source intervals, whether the source runs at the display-locked rate,
+    // and whether a pool of two ever held the game back
+    intervals: Vec<f64>,
+    locked: bool,
+    throttled: bool,
+    // the pool size last seen, and the source frame until which the governor waits after it changed
+    seen_cap: u32,
+    cap_settled: u64,
 }
 
 impl Worker {
@@ -810,6 +906,11 @@ impl Worker {
             dump_dir: std::env::var_os("LSFGM_METAL_DUMP")
                 .filter(|d| !d.is_empty())
                 .map(PathBuf::from),
+            intervals: vec![],
+            locked: false,
+            throttled: false,
+            seen_cap: 3,
+            cap_settled: 0,
         }
     }
 
@@ -1058,6 +1159,44 @@ impl Worker {
         b.submit(&[cb], &[], &[signal], fence)
     }
 
+    // at the display-locked rate a third game drawable only queues one more frame; give it back if two hold the game back
+    fn size_pool(&mut self, interval: f64, m: u32) {
+        if !(interval.is_finite() && interval > 0.0) {
+            return;
+        }
+        self.intervals.push(interval);
+        if self.intervals.len() < 30 {
+            return;
+        }
+        let mut w = std::mem::take(&mut self.intervals);
+        w.sort_unstable_by(f64::total_cmp);
+        let median = w[w.len() / 2];
+        let locked = m as f64 * self.refresh;
+        self.locked = median < locked * 1.01;
+        self.throttled |= self.gen.cap_released.load(Ordering::Relaxed);
+        if self.throttled {
+            return;
+        }
+        let cap = &self.gen.pool_cap;
+        if cap.load(Ordering::Relaxed) == 3 && self.locked {
+            let patience = Duration::from_secs_f64(locked * 4.0);
+            self.gen.cap_patience.store(patience.as_nanos() as u64, Ordering::Relaxed);
+            cap.store(2, Ordering::Relaxed);
+            log::info("Metal source runs at the display-locked rate, holding the game to two drawables");
+        } else if cap.load(Ordering::Relaxed) == 2 && median > locked * 1.05 {
+            cap.store(3, Ordering::Relaxed);
+            self.gen.cap_released.store(true, Ordering::Relaxed);
+            self.throttled = true;
+            // a game waiting on the pool may take the third drawable now
+            let _pool = self.gen.pool.lock().unwrap();
+            self.gen.pool_cv.notify_all();
+            log::info(&format!(
+                "Metal source slowed to {:.1} ms with two drawables, going back to three",
+                median * 1000.0
+            ));
+        }
+    }
+
     fn next_real(&self, what: &str) -> Result<Drawable, Fail> {
         hooks::original_next_drawable(&self.gen.layer).ok_or_else(|| Fail::Mismatch(what.into()))
     }
@@ -1090,9 +1229,52 @@ impl Worker {
             };
         }
         let m = self.setup.profile.multiplier;
+        if self.pacer.is_none() && self.setup.profile.low_latency {
+            self.size_pool(job.sample.interval, m);
+        }
         let slots: Vec<f64> = match &mut self.pacer {
             Some(p) => p.slots(job.sample),
             None => (1..=m).map(|i| i as f64 / m as f64).collect(),
+        };
+        let slots = {
+            let mut g = self.gen.governor.lock().unwrap();
+            g.refresh = self.refresh;
+            // a pool size change moves the latency by itself: measure afresh and let it settle before skipping
+            let cap = self.gen.pool_cap.load(Ordering::Relaxed);
+            if cap != self.seen_cap {
+                self.seen_cap = cap;
+                self.cap_settled = self.stats.source + 60;
+                g.latency.clear();
+                g.waits.clear();
+                // a skip that can no longer be judged counts as one that did not help
+                if g.before > 0.0 {
+                    g.before = 0.0;
+                    g.failures += 1;
+                    g.backoff = if g.failures >= 2 { u32::MAX } else { 60 };
+                }
+            }
+            // only a source at the display-locked rate cannot drain a backlog; a slower one drains it by itself
+            let skip = std::mem::take(&mut g.skip);
+            let take = skip
+                && self.setup.profile.low_latency
+                && self.locked
+                && self.stats.source >= self.cap_settled;
+            if skip && !take {
+                // not taken, so the next window must not judge it
+                g.before = 0.0;
+            }
+            if take {
+                // the samples until the skip reaches the screen still carry the old latency
+                g.latency.clear();
+                g.waits.clear();
+                log::info(&format!(
+                    "Metal present queue backed up (first generated frame waits {:.1} ms for a drawable), skipping one generated frame",
+                    g.backlog * 1000.0
+                ));
+                vec![1.0]
+            } else {
+                slots
+            }
         };
         let show_original = *slots.last().unwrap() >= 1.0;
         let inserted = slots.len() - show_original as usize;
@@ -1122,8 +1304,12 @@ impl Worker {
         for (i, &slot) in slots.iter().take(inserted).enumerate() {
             self.ctx.as_mut().unwrap().generate(slot)?;
             let acquire_start = job.latency.clock();
+            let waited = super::now();
             let target = self.next_real("no drawable for a generated frame")?;
             let acquire_ms = (job.latency.clock() - acquire_start) * 1000.0;
+            if i == 0 {
+                self.gen.governor.lock().unwrap().wait(super::now() - waited);
+            }
             let ttex = target.texture();
             let timg = self.imported(&ttex)?;
             let ready = self.next_serial();
@@ -1162,6 +1348,7 @@ impl Worker {
             self.copy(self.cmd[1 + inserted], source, timg, (present, ready), fence)?;
             self.frame_pending = true;
             forward_presented(job.drawable.clone(), &target);
+            govern(self.gen, &target, job.latency.committed);
             self.gen.latency.attach(
                 &target,
                 job.latency,
@@ -1369,6 +1556,17 @@ impl Drop for Recycle {
     }
 }
 
+// feed the governor the commit-to-display time of an original frame
+fn govern(gen: &'static Generator, shown: &ProtocolObject<dyn CAMetalDrawable>, committed: f64) {
+    let block = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+        let displayed = unsafe { d.as_ref() }.presentedTime();
+        if displayed > committed && committed > 0.0 {
+            gen.governor.lock().unwrap().sample(displayed - committed);
+        }
+    });
+    unsafe { shown.addPresentedHandler(RcBlock::as_ptr(&block)) };
+}
+
 fn forward_presented(proxy: Retained<ProxyDrawable>, shown: &ProtocolObject<dyn CAMetalDrawable>) {
     let proxy = Recycle(proxy);
     let block = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
@@ -1394,6 +1592,39 @@ pub(crate) fn half_to_f32(h: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn governor_skips_a_backlog_once_and_backs_off_when_it_does_not_help() {
+        let r = 1.0 / 60.0;
+        let mut g = super::Governor {
+            refresh: r,
+            ..Default::default()
+        };
+        let window = |g: &mut super::Governor, wait: f64, latency: f64| {
+            for _ in 0..30 {
+                g.wait(wait);
+                g.sample(latency);
+            }
+        };
+        // no drawable wait, nothing to drain
+        window(&mut g, 0.0, 0.080);
+        assert!(!g.skip);
+        // the first generated frame waits most of a refresh: skip once
+        window(&mut g, 0.8 * r, 0.080);
+        assert!(std::mem::take(&mut g.skip));
+        // the skip did not shorten the latency: back off instead of skipping again
+        window(&mut g, 0.8 * r, 0.080);
+        assert!(!g.skip && g.backoff > 0);
+        for _ in 0..g.backoff {
+            window(&mut g, 0.8 * r, 0.080);
+            assert!(!g.skip);
+        }
+        window(&mut g, 0.8 * r, 0.080);
+        assert!(std::mem::take(&mut g.skip));
+        // a second skip that does not help ends the retries
+        window(&mut g, 0.8 * r, 0.080);
+        assert_eq!(g.backoff, u32::MAX);
+    }
+
     #[test]
     fn half_conversion() {
         assert_eq!(super::half_to_f32(0x3c00), 1.0);

@@ -258,23 +258,36 @@ impl ProxySwapchain {
             log::debug(&format!("Vulkan proxy acquire out of date: invalid {} layer {}x{} extent {}x{}", s.invalid, natural.0, natural.1, self.extent.0, self.extent.1));
             return vk::Result::ERROR_OUT_OF_DATE_KHR;
         }
-        let deadline = Instant::now() + Duration::from_nanos(timeout.min(i64::MAX as u64));
+        let start = Instant::now();
+        let deadline = start + Duration::from_nanos(timeout.min(i64::MAX as u64));
         let i = loop {
-            if let Some(i) = s.status.iter().position(|&st| st == Status::Free) {
+            let free = s.status.iter().position(|&st| st == Status::Free);
+            let busy = s.status.iter().filter(|&&st| st != Status::Free).count();
+            // a free image held back only by the cap is re-checked; the cap gives way once the wait runs long
+            let capped = free.is_some() && busy >= self.gen.pool_cap(start.elapsed());
+            if let (Some(i), false) = (free, capped) {
                 break i;
             }
             if timeout == 0 {
                 return vk::Result::NOT_READY;
             }
+            let slice = if capped {
+                Duration::from_millis(10)
+            } else {
+                Duration::MAX
+            };
             if timeout == u64::MAX {
-                s = cv.wait(s).unwrap();
+                s = match slice {
+                    Duration::MAX => cv.wait(s).unwrap(),
+                    d => cv.wait_timeout(s, d).unwrap().0,
+                };
                 continue;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return vk::Result::TIMEOUT;
             }
-            s = cv.wait_timeout(s, left).unwrap().0;
+            s = cv.wait_timeout(s, left.min(slice)).unwrap().0;
         };
         s.status[i] = Status::Acquired;
         s.blocked += now() - t0;

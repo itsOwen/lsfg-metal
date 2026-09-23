@@ -233,6 +233,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_PACING_MODE` | pacing | `vsync` or `none` (fixed), `adaptive`; matched case-insensitively | `vsync` |
 | `LSFGM_OVERRIDE_PRESENT_MODE` | force vsync: FIFO on wrapped swapchains, `displaySyncEnabled` on Metal layers; `0` leaves the game's own present mode and display sync in place on every path | `1` is true, other non-empty is false | true |
 | `LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT` | keep the game's image count | `1` is true, other non-empty is false | false |
+| `LSFGM_LOW_LATENCY` | shorter present queue on the Metal path and the proxy swapchain (see below) | `1` is true, other non-empty is false | false |
 | `LSFGM_DLL_PATH` | path to `lsfg-vk.dll` | path | unset, see discovery below |
 | `LSFGM_NO_FP16` | disable half precision | `allow_fp16 = (value != "1")` | unset, fp16 allowed |
 | `LSFGM_LOG_LEVEL` | log level | `debug`, `info`, `warning`, `error` | `info` |
@@ -322,6 +323,7 @@ flow_scale = 1.0
 performance_mode = false
 override_present_mode = true
 preserve_swapchain_image_count = false
+low_latency = false
 ```
 
 `dll` and `log_file` appear in `[global]` only when set (`~` is expanded on read); `active_in` is a
@@ -357,6 +359,24 @@ present and costs nothing beyond the extra inner passes it allocates. `override_
 created, so changing them takes effect only when the game recreates it. Only the Vulkan fixed present path checks the
 watcher: the Metal front end and the Vulkan proxy path capture the profile once when they are set
 up, so a config change does not reach them until the swapchain or layer is rebuilt.
+
+`low_latency` (Metal path and Vulkan proxy swapchain, fixed pacing, off by default). A game and a
+display that run at the same rate never drain a frame that got stuck in the present queue, and a
+game that runs ahead of the display fills every drawable it may hold. With `low_latency` on, a game
+running at the display-locked rate (refresh divided by the multiplier) may hold two drawables
+instead of three, going back to three for good if two ever slow it down, and one generated frame is
+skipped when the first generated frame of each source frame keeps waiting for a drawable while the
+source runs at that rate. Skips wait 60 source frames after any change of the drawable count, and a
+skip that does not shorten the latency is retried once, 60 windows of 30 originals later (a minute
+at 30 fps), and then never again for that layer. A game that waits on two drawables for longer than
+four display-locked intervals, for example one that acquires twice before it presents, gets the
+third back for good. On an M2 Air at 60 Hz this took commit-to-display of original frames from 99.5
+to 66.2 ms in Codename CURE II with DXMT and from 98.9 to 65.6 ms with DXVK (2x), from 149 to 99 ms
+uncapped at 3x, and from 99 to 65.6 ms in the `mtlclear` smoke test at 30 fps. The cost is power
+when the GPU is near its limit: with less work queued it runs at higher clocks for shorter bursts,
+and in the same Codename scene with DXMT GPU power rose from 1.8 to 4.7 W (with DXVK it did not
+rise, 2.5 to 2.3 W). Turn it on when latency matters more than battery and heat. Adaptive pacing is
+unaffected.
 
 Profile selection order:
 
@@ -585,16 +605,17 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 34 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
+**Unit tests.** 35 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, cap
 behaviour, untrusted runs and probing, invalid intervals, the hitch floor on a fast display, a
-closed-loop convergence model), the settings library (environment mode, config path
-precedence, TOML round trip and `~` expansion, error messages, profile identification order including
-the kill switch, executable-name matching and the catch-all profile, reload on mtime change), the refresh-interval
-conversion, the PE resource walk, the feature-chain copy, memory type selection, the memory
-planner, the pipeline signature tables, the recursive mutex, half-float conversion, the
-latency probe's percentiles and the OpenGL state restore.
+closed-loop convergence model), the settings library (environment mode, config
+path precedence, TOML round trip and `~` expansion, error messages, profile identification order
+including the kill switch, executable-name matching and the catch-all profile, reload on mtime
+change), the refresh-interval conversion, the PE resource walk, the feature-chain copy, memory type
+selection, the memory planner, the pipeline signature tables, the recursive mutex, half-float
+conversion, the latency probe's percentiles, the present queue governor's skip and backoff, and the
+OpenGL state restore.
 
 **`validate`.** Runs the generator on a real driver with synthetic input and reports timings and the
 centre pixel of the last generated frame.

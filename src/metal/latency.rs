@@ -12,10 +12,13 @@ use crate::log;
 pub struct Frame {
     queued: f64,
     started: f64,
+    // always set: the governor measures commit to display without LSFGM_LATENCY
+    pub committed: f64,
 }
 
 impl Frame {
     pub fn enqueue(&mut self) {
+        self.committed = clock();
         static ENABLED: OnceLock<bool> = OnceLock::new();
         if *ENABLED.get_or_init(|| std::env::var_os("LSFGM_LATENCY").is_some()) {
             self.queued = clock();

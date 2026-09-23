@@ -77,6 +77,7 @@ pub struct Profile {
     pub performance_mode: bool,
     pub override_present_mode: bool,
     pub preserve_swapchain_image_count: bool,
+    pub low_latency: bool,
 }
 
 impl Default for Profile {
@@ -90,6 +91,7 @@ impl Default for Profile {
             performance_mode: false,
             override_present_mode: true,
             preserve_swapchain_image_count: false,
+            low_latency: false,
         }
     }
 }
@@ -200,6 +202,9 @@ fn env_profile(env: Env) -> Result<Profile, String> {
     }
     if let Some(v) = nonempty(env, "LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT") {
         p.preserve_swapchain_image_count = v == "1";
+    }
+    if let Some(v) = nonempty(env, "LSFGM_LOW_LATENCY") {
+        p.low_latency = v == "1";
     }
     if p.multiplier > 4 {
         return Err("The macOS shim supports multipliers from 2 to 4".into());
@@ -456,6 +461,7 @@ pub fn parse(text: &str, env: Env) -> Result<Config, String> {
                     "preserve_swapchain_image_count" => {
                         p.preserve_swapchain_image_count = as_bool(val, key)?
                     }
+                    "low_latency" => p.low_latency = as_bool(val, key)?,
                     _ => return Err(format!("Unknown key in profile section: {key}")),
                 }
             }
@@ -524,13 +530,14 @@ pub fn to_toml(cfg: &Config) -> String {
         }
         let _ = writeln!(
             out,
-            "pacing_mode = {}\nmultiplier = {}\nflow_scale = {:?}\nperformance_mode = {}\noverride_present_mode = {}\npreserve_swapchain_image_count = {}",
+            "pacing_mode = {}\nmultiplier = {}\nflow_scale = {:?}\nperformance_mode = {}\noverride_present_mode = {}\npreserve_swapchain_image_count = {}\nlow_latency = {}",
             q(p.pacing_mode.name()),
             p.multiplier,
             p.flow_scale,
             p.performance_mode,
             p.override_present_mode,
-            p.preserve_swapchain_image_count
+            p.preserve_swapchain_image_count,
+            p.low_latency
         );
     }
     out
@@ -774,9 +781,10 @@ mod tests {
             ("LSFGM_ENV", "1"),
             ("LSFGM_PERFORMANCE_MODE", "yes"),
             ("LSFGM_PACING_MODE", "None"),
+            ("LSFGM_LOW_LATENCY", "1"),
         ]);
         let p = &load_with(&e).unwrap().profiles[0];
-        assert!(!p.performance_mode);
+        assert!(!p.performance_mode && p.low_latency);
         assert_eq!(p.pacing_mode, PacingMode::Vsync);
     }
 
