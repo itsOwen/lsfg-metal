@@ -294,6 +294,10 @@ unsafe fn generate(
         present();
         return Ok(());
     }
+    // every frame, also while the context builds: the game or wine can reset the swap interval
+    if p.override_present_mode {
+        CGLSetParameter(cgl, CGL_SWAP_INTERVAL, &1);
+    }
     if front.contexts.get(&key).is_none_or(|c| c.extent != extent) {
         if let Some(old) = front.contexts.remove(&key) {
             old.destroy(front.backend.as_ref());
@@ -317,10 +321,6 @@ unsafe fn generate(
             extent.0, extent.1, p.multiplier, p.flow_for(extent.1)
         ));
         front.contexts.insert(key, c);
-    }
-    // every frame: the game or wine can reset the swap interval after the context was set up
-    if p.override_present_mode {
-        CGLSetParameter(cgl, CGL_SWAP_INTERVAL, &1);
     }
     let c = front.contexts.get_mut(&key).unwrap();
     // time held in generated swaps makes the sample untrusted; the pacer then probes with the original alone
