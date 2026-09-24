@@ -406,20 +406,19 @@ Supported subset of TOML:
   is `Profile '<name>' has multiplier < 1`) and its `flow_scale` 0.25 to 1.0 or `"auto"`. Multiplier
   1 is accepted here and disables generation; environment mode is stricter and requires 2 to 4.
 
-Reload on change: the shim stats the config file at every present and records its modification time
-as `(seconds, nanoseconds)`. When the mtime changes it reparses, logs
-`Config file changed on disk, reloading...`, and adopts the profile with the **same name** as the
-active one. If that name is gone the old profile is kept. A parse failure leaves the recorded mtime
+Reload on change: on the Vulkan fixed present path the shim stats the config file at every present
+and records its modification time as `(seconds, nanoseconds)`. When the mtime changes it reparses,
+logs `Config file changed on disk, reloading...`, and adopts the profile with the **same name** as
+the active one. If that name is gone the old profile is kept. A parse failure leaves the recorded mtime
 untouched, so the next present retries the same file; this is what covers a half-written file. The
 watcher is not created when `LSFGM_ENV` is set. Only `flow_scale` and `performance_mode` are baked
 into the pipeline, so only those two rebuild it on reload; a new `multiplier` is re-read on the next
 present and costs nothing beyond the extra inner passes it allocates. `override_present_mode` and
 `preserve_swapchain_image_count` are properties of the swapchain itself and are captured when it is
 created, so changing them takes effect only when the game recreates it. A changed `log_file` is
-opened on reload. Only the Vulkan fixed
-present path checks the watcher: the Metal front end, the Vulkan proxy path and the OpenGL front end
-capture the profile once when they are set up, so a config change does not reach them until the
-swapchain or layer is rebuilt.
+opened on reload. Only the Vulkan fixed present path checks the watcher. The Metal front end, the
+Vulkan proxy path (which Vulkan games take by default) and the OpenGL front end read the profile
+once per process, so a config change reaches them only when the game is restarted.
 
 `flow_scale = "auto"` picks 1080 divided by the source height, clamped to 0.25 to 1.0: 1.0 at 1080p,
 0.75 at 1440p, 0.5 at 2160p, which is the scale Lossless Scaling itself recommends for each. Every
