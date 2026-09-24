@@ -604,9 +604,9 @@ fixed path. Leave the variable unset to avoid timestamp and callback overhead.
 
 **`LSFGM_METAL_DUMP=<dir>`.** On the Metal path, source frame 89 is written as `<dir>/previous`,
 source frame 90 as `<dir>/original`, and each generated frame of frame 90 as `<dir>/generated<i>`.
-Format is PPM (`P6 <w> <h> 255\n` then RGB bytes, B and R swapped for BGRA and `BGR10A2Unorm`,
-10-bit formats reduced to 8 bits per channel, alpha dropped),
-or PFM for `RGBA16Float` (`PF\n<w> <h>\n-1.0\n` then bottom-to-top RGB float32 rows). With the
+Format is PPM for 8-bit layers (`P6 <w> <h> 255\n` then RGB bytes, B and R swapped for BGRA,
+alpha dropped) and PFM for everything deeper (`PF\n<w> <h>\n-1.0\n` then bottom-to-top RGB
+float32 rows: half floats as they are, 10-bit as value/1023, XR as (value - 384)/510). With the
 `mtlclear` smoke test, whose white square moves 8 px per frame, the generated frames must show the
 square at intermediate positions. That is the check that the output is interpolation and not a copy.
 

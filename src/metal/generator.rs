@@ -876,6 +876,9 @@ fn unorm_view(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Texture, &'sta
     }
 }
 
+// one pixel of a dumped frame, deeper than 8 bits, as rgb floats
+type Decode = fn(&[u8]) -> [f32; 3];
+
 // ---- worker ----
 
 enum Fail {
@@ -1577,8 +1580,11 @@ impl Worker {
     fn dump(&self, texture: &ProtocolObject<dyn MTLTexture>, name: &str, value: u64) {
         let Some(dir) = &self.dump_dir else { return };
         let (w, h, format) = (texture.width(), texture.height(), texture.pixelFormat());
-        let hdr = format == MTLPixelFormat::RGBA16Float;
-        let bpp = if hdr { 8 } else { 4 };
+        let wide = matches!(
+            format,
+            MTLPixelFormat::RGBA16Float | MTLPixelFormat::BGRA10_XR | MTLPixelFormat::BGRA10_XR_sRGB
+        );
+        let bpp = if wide { 8 } else { 4 };
         let len = w * h * bpp;
         let (Some(buffer), Ok(cb)) = (
             self.gen
@@ -1611,42 +1617,47 @@ impl Worker {
         let px =
             unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr() as *const u8, len) };
         let mut out = Vec::with_capacity(len);
-        if hdr {
+        // anything deeper than 8 bits is written as float, so a dump keeps every bit the frame has
+        let decode: Option<Decode> = match format {
+            MTLPixelFormat::RGBA16Float => Some(|p| {
+                let c = |i: usize| half_to_f32(u16::from_le_bytes([p[i], p[i + 1]]));
+                [c(0), c(2), c(4)]
+            }),
+            // 10-bit is one little-endian word, red in the low ten bits (blue for bgr10a2)
+            MTLPixelFormat::RGB10A2Unorm => Some(|p| {
+                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                [0, 10, 20].map(|s| ((v >> s) & 0x3ff) as f32 / 1023.0)
+            }),
+            MTLPixelFormat::BGR10A2Unorm => Some(|p| {
+                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                [20, 10, 0].map(|s| ((v >> s) & 0x3ff) as f32 / 1023.0)
+            }),
+            // xr stores (value * 510 + 384) in ten bits, blue lowest
+            MTLPixelFormat::BGR10_XR | MTLPixelFormat::BGR10_XR_sRGB => Some(|p| {
+                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                [20, 10, 0].map(|s| (((v >> s) & 0x3ff) as f32 - 384.0) / 510.0)
+            }),
+            // the 64-bit xr keeps each ten bits at the top of a 16-bit word, in b g r a order
+            MTLPixelFormat::BGRA10_XR | MTLPixelFormat::BGRA10_XR_sRGB => Some(|p| {
+                let c = |i: usize| ((u16::from_le_bytes([p[i], p[i + 1]]) >> 6) as f32 - 384.0) / 510.0;
+                [c(4), c(2), c(0)]
+            }),
+            _ => None,
+        };
+        if let Some(decode) = decode {
             out.extend_from_slice(format!("PF\n{w} {h}\n-1.0\n").as_bytes());
             for y in (0..h).rev() {
-                for x in 0..w {
-                    for c in 0..3 {
-                        let i = (y * w + x) * 8 + c * 2;
-                        out.extend_from_slice(
-                            &half_to_f32(u16::from_le_bytes([px[i], px[i + 1]])).to_le_bytes(),
-                        );
+                for p in px[y * w * bpp..(y + 1) * w * bpp].chunks_exact(bpp) {
+                    for c in decode(p) {
+                        out.extend_from_slice(&c.to_le_bytes());
                     }
                 }
             }
         } else {
-            let bgra = matches!(
-                format,
-                MTLPixelFormat::BGRA8Unorm
-                    | MTLPixelFormat::BGRA8Unorm_sRGB
-                    | MTLPixelFormat::BGR10A2Unorm
-            );
-            let packed = matches!(
-                format,
-                MTLPixelFormat::RGB10A2Unorm | MTLPixelFormat::BGR10A2Unorm
-            );
+            let bgra = matches!(format, MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB);
             out.extend_from_slice(format!("P6 {w} {h} 255\n").as_bytes());
             for p in px.chunks_exact(4) {
-                // 10-bit is one little-endian word, red in the low ten bits (blue for bgr10a2)
-                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-                out.extend_from_slice(&if packed && bgra {
-                    [(v >> 22) as u8, (v >> 12) as u8, (v >> 2) as u8]
-                } else if packed {
-                    [(v >> 2) as u8, (v >> 12) as u8, (v >> 22) as u8]
-                } else if bgra {
-                    [p[2], p[1], p[0]]
-                } else {
-                    [p[0], p[1], p[2]]
-                });
+                out.extend_from_slice(&if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] });
             }
         }
         let _ = std::fs::create_dir_all(dir);
