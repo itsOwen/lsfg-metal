@@ -221,7 +221,10 @@ fn main_screen_fps() -> isize {
     };
     unsafe {
         let screen: *mut AnyObject = objc2::msg_send![cls, mainScreen];
-        if screen.is_null() {
+        // maximumFramesPerSecond is macos 12 or newer; on 11 the 0 below makes the caller use 60
+        let known: bool = !screen.is_null()
+            && objc2::msg_send![screen, respondsToSelector: objc2::sel!(maximumFramesPerSecond)];
+        if !known {
             0
         } else {
             objc2::msg_send![screen, maximumFramesPerSecond]
