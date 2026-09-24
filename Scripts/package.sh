@@ -1,10 +1,10 @@
 #!/bin/sh
-# dist/renderers/lsfg with the shim as libMoltenVK.dylib, the real-driver symlink, LICENSE and source.txt
+# dist/renderers/lsfg with the shim as libMoltenVK.dylib, the real-driver symlink, LICENSE, THIRD_PARTY.txt and source.txt
 # does not build: the caller builds (with the same LSFGM_VERSION, so the compiled-in version matches source.txt)
 set -e
 cd "$(dirname "$0")/.."
 out=dist/renderers/lsfg
-version="${LSFGM_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.7.1)}"
+version="${LSFGM_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.8.0)}"
 # the arm64 build packages the same way; the caller picks which one is already built
 target="${LSFGM_TARGET:-x86_64-apple-darwin}"
 rm -rf "$out"
@@ -12,6 +12,7 @@ mkdir -p "$out"
 cp "target/$target/release/liblsfg_metal.dylib" "$out/libMoltenVK.dylib"
 ln -s ../../frameworks/libMoltenVK.dylib "$out/libMoltenVK.real.dylib"
 cp LICENSE "$out/LICENSE"
+cp THIRD_PARTY.txt "$out/THIRD_PARTY.txt"
 printf '%s\n' "lsfg-metal $version" "Source: https://github.com/itsOwen/lsfg-metal" "License: MIT (see LICENSE)" > "$out/source.txt"
 
 codesign -s - -f "$out/libMoltenVK.dylib"

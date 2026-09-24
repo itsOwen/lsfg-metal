@@ -77,15 +77,14 @@ pub fn setup() -> Option<&'static Setup> {
     SETUP.get()
 }
 
-// metal to vulkan format map
+// metal to vulkan format map; srgb imports as unorm so blits copy the encoded bytes instead of linearising them
 pub(crate) fn vk_format(f: MTLPixelFormat) -> Result<vk::Format, String> {
     Ok(match f {
-        MTLPixelFormat::BGRA8Unorm => vk::Format::B8G8R8A8_UNORM,
-        MTLPixelFormat::BGRA8Unorm_sRGB => vk::Format::B8G8R8A8_SRGB,
-        MTLPixelFormat::RGBA8Unorm => vk::Format::R8G8B8A8_UNORM,
-        MTLPixelFormat::RGBA8Unorm_sRGB => vk::Format::R8G8B8A8_SRGB,
+        MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB => vk::Format::B8G8R8A8_UNORM,
+        MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::RGBA8Unorm_sRGB => vk::Format::R8G8B8A8_UNORM,
         MTLPixelFormat::RGBA16Float => vk::Format::R16G16B16A16_SFLOAT,
         MTLPixelFormat::RGB10A2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        MTLPixelFormat::BGR10A2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         other => return Err(format!("unsupported drawable pixel format {}", other.0)),
     })
 }
@@ -99,6 +98,7 @@ pub(crate) fn mtl_format(f: vk::Format) -> Option<MTLPixelFormat> {
         vk::Format::R8G8B8A8_SRGB => MTLPixelFormat::RGBA8Unorm_sRGB,
         vk::Format::R16G16B16A16_SFLOAT => MTLPixelFormat::RGBA16Float,
         vk::Format::A2B10G10R10_UNORM_PACK32 => MTLPixelFormat::RGB10A2Unorm,
+        vk::Format::A2R10G10B10_UNORM_PACK32 => MTLPixelFormat::BGR10A2Unorm,
         _ => return None,
     })
 }

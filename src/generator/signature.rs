@@ -34,6 +34,39 @@ const RGBA8: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const R8: vk::Format = vk::Format::R8_UNORM;
 const RGBA16F: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+// storage of the source and generated images (flag H); all but half float are 32 bits a pixel and cost what rgba8 does
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Store {
+    Rgba8,
+    Rgb10a2,
+    // shared-exponent float: 9-bit precision and no clipping above 1, for gamma-encoded float sources
+    Rgb9e5,
+    Bgr10Xr,
+    Rgba16f,
+}
+
+// a source's colour in the generator: its storage and the dxgi colour kind (0 encoded, 1 linear sdr, 2 linear hdr)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Colour {
+    pub store: Store,
+    pub kind: u32,
+}
+
+impl Colour {
+    pub const SDR: Colour = Colour { store: Store::Rgba8, kind: 0 };
+    pub const HDR: Colour = Colour { store: Store::Rgba16f, kind: 2 };
+
+    // the vulkan generator has only rgba8 and half float, so anything deeper than 8 bits runs in half float there
+    pub fn float(self) -> bool {
+        self.store != Store::Rgba8
+    }
+
+    // colour kind and hdr support, as the uniform block carries them
+    pub fn block(self) -> [u32; 2] {
+        [self.kind, (self.kind == 2) as u32]
+    }
+}
+
 // extent rule: base B or F, then (add, shift) steps
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rule {
@@ -121,6 +154,14 @@ pub enum Binding {
     Sampler,
     Storage(Vec<usize>),
     Sampled(Vec<usize>),
+}
+
+// one dispatch: (sub-iteration, groups, special)
+pub type Dispatch = (u32, (u32, u32), bool);
+
+pub struct StageTab {
+    // (shader, dispatches) runs
+    pub subs: Vec<(usize, Vec<Dispatch>)>,
 }
 
 pub struct Signature {
@@ -394,6 +435,37 @@ impl Signature {
         }
     }
 
+    // the dispatches of every stage at this size, consecutive passes of one shader grouped
+    pub fn tabs(&self, w: u32, h: u32, flow: f32) -> Vec<StageTab> {
+        self.stages
+            .iter()
+            .map(|stage| {
+                let mut subs: Vec<(usize, Vec<Dispatch>)> = vec![];
+                for &p in stage {
+                    let pass = &self.passes[p];
+                    let entry = (
+                        self.subiter[p],
+                        pass.rule.eval(w, h, flow),
+                        pass.flags & SPECIAL != 0,
+                    );
+                    match subs.last_mut() {
+                        Some((sh, v)) if *sh == pass.shader => v.push(entry),
+                        _ => subs.push((pass.shader, vec![entry])),
+                    }
+                }
+                StageTab { subs }
+            })
+            .collect()
+    }
+
+    // false when a pass would get an empty grid, so later passes would read texels nothing wrote
+    pub fn fits(&self, w: u32, h: u32, flow: f32) -> bool {
+        self.passes.iter().all(|p| {
+            let (x, y) = p.rule.eval(w, h, flow);
+            x > 0 && y > 0
+        })
+    }
+
     // descriptor count of a binding: images expand to their sub-images
     pub fn count(&self, b: &Binding) -> u32 {
         match b {
@@ -462,6 +534,18 @@ mod tests {
                 let read = s.passes.iter().any(|p| p.inputs.contains(&Some(i)));
                 assert!(im.is(P) || read, "image {i} never read");
             }
+        }
+    }
+
+    // the coarsest pass works on 1/128 of the flowed size, rounded, so 64 flowed pixels is the floor
+    #[test]
+    fn fits_from_64_flowed_pixels() {
+        for perf in [false, true] {
+            let s = Signature::new(perf);
+            assert!(s.fits(64, 64, 1.0) && s.fits(1920, 1080, 0.25));
+            assert!(!s.fits(63, 1080, 1.0) && !s.fits(1920, 63, 1.0));
+            assert!(s.fits(256, 256, 0.25) && !s.fits(255, 1080, 0.25));
+            assert!(!s.fits(0, 0, 1.0));
         }
     }
 }

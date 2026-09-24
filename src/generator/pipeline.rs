@@ -20,7 +20,7 @@ pub struct Pipeline {
     pub sig: Signature,
     pub extent: (u32, u32),
     pub flow: f32,
-    pub hdr: bool,
+    pub colour: Colour,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     imgs: Vec<Img>,
@@ -36,6 +36,9 @@ pub struct Pipeline {
     cmd_pool: vk::CommandPool,
     pub cmd: [vk::CommandBuffer; 2],
     params: HashMap<u64, (vk::CommandBuffer, f32)>,
+    // LSFGM_GPU_PROFILE: a timestamp at each command buffer start and after every stage
+    profile: vk::QueryPool,
+    pub stage_labels: Vec<String>,
     pub source: vk::Image,
     pub destination: vk::Image,
 }
@@ -96,16 +99,6 @@ fn cache_path(perf: bool, uuid: [u8; 16]) -> Option<PathBuf> {
     )))
 }
 
-// one dispatch: (sub-iteration, groups, special)
-type Dispatch = (u32, (u32, u32), bool);
-
-struct StageTab {
-    sampled: Vec<usize>,
-    stored: Vec<usize>,
-    // (shader, dispatches) runs
-    subs: Vec<(usize, Vec<Dispatch>)>,
-}
-
 impl Pipeline {
     pub fn new(
         inst: Arc<Instance>,
@@ -113,14 +106,14 @@ impl Pipeline {
         h: u32,
         flow: f32,
         perf: bool,
-        hdr: bool,
+        colour: Colour,
     ) -> Result<Pipeline, String> {
         let mut p = Pipeline {
             inst,
             sig: Signature::new(perf),
             extent: (w, h),
             flow,
-            hdr,
+            colour,
             set_layout: Default::default(),
             layout: Default::default(),
             imgs: vec![],
@@ -136,6 +129,8 @@ impl Pipeline {
             cmd_pool: Default::default(),
             cmd: Default::default(),
             params: HashMap::new(),
+            profile: Default::default(),
+            stage_labels: vec![],
             source: Default::default(),
             destination: Default::default(),
         };
@@ -147,7 +142,7 @@ impl Pipeline {
     fn build(&mut self) -> Result<(), String> {
         let inst = self.inst.clone();
         let (d, pd, log) = (&inst.device, inst.physical_device, inst.log);
-        let ((w, h), flow, hdr, perf) = (self.extent, self.flow, self.hdr, self.sig.perf);
+        let ((w, h), flow, hdr, perf) = (self.extent, self.flow, self.colour.float(), self.sig.perf);
         log(&format!(
             "Building pipeline for {w}x{h} at {flow:.2} flow ({})",
             if perf { "performance" } else { "quality" }
@@ -357,8 +352,8 @@ impl Pipeline {
         let block = [
             0u32,
             0,
-            if hdr { 2 } else { 0 },
-            if hdr { 1 } else { 0 },
+            self.colour.block()[0],
+            self.colour.block()[1],
             (1.0 / flow).to_bits(),
             0.5f32.to_bits(),
         ];
@@ -535,38 +530,36 @@ impl Pipeline {
         log(&format!("  Created {} pipelines", self.pipelines.len()));
 
         // stage tables
-        let tabs: Vec<StageTab> = self
-            .sig
-            .stages
+        let tabs = self.sig.tabs(w, h, flow);
+        log(&format!("  Built {} pipeline stages", tabs.len()));
+        let stages = tabs.len() as u32;
+        let split = self.sig.split as u32;
+        self.stage_labels = tabs
             .iter()
-            .map(|stage| {
-                let mut t = StageTab {
-                    sampled: vec![],
-                    stored: vec![],
-                    subs: vec![],
-                };
-                for &p in stage {
-                    let pass = &self.sig.passes[p];
-                    for &i in pass.inputs.iter().flatten() {
-                        if !t.sampled.contains(&i) {
-                            t.sampled.push(i);
-                        }
-                    }
-                    t.stored.push(pass.output);
-                    let entry = (
-                        self.sig.subiter[p],
-                        pass.rule.eval(w, h, flow),
-                        pass.flags & SPECIAL != 0,
-                    );
-                    match t.subs.last_mut() {
-                        Some((sh, v)) if *sh == pass.shader => v.push(entry),
-                        _ => t.subs.push((pass.shader, vec![entry])),
-                    }
-                }
-                t
+            .map(|t| {
+                let n: Vec<String> = t
+                    .subs
+                    .iter()
+                    .map(|(sh, v)| format!("{}x{}", SHADERS[*sh], v.len()))
+                    .collect();
+                n.join(" ")
             })
             .collect();
-        log(&format!("  Built {} pipeline stages", tabs.len()));
+        let bits = || {
+            let families = unsafe { inst.instance.get_physical_device_queue_family_properties(pd) };
+            families.get(inst.family as usize).map_or(0, |f| f.timestamp_valid_bits)
+        };
+        if std::env::var_os("LSFGM_GPU_PROFILE").is_some() && bits() == 0 {
+            crate::log::warn("LSFGM_GPU_PROFILE ignored: this queue has no GPU timestamps");
+        } else if std::env::var_os("LSFGM_GPU_PROFILE").is_some() {
+            let info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(stages + 2);
+            self.profile = check(
+                unsafe { d.create_query_pool(&info, None) },
+                "vkCreateQueryPool",
+            )?;
+        }
 
         // one-time transition to general
         // a resettable pool, so the parameter-update buffers can be re-recorded in place
@@ -627,6 +620,18 @@ impl Pipeline {
                 )
             };
         }
+        // query 0 starts the pre-pass, stages + 1 the main pass, st + 1 ends stage st
+        if self.profile != vk::QueryPool::null() {
+            let ts = |cb, q| unsafe {
+                d.cmd_write_timestamp(cb, vk::PipelineStageFlags::COMPUTE_SHADER, self.profile, q)
+            };
+            unsafe {
+                d.cmd_reset_query_pool(self.cmd[0], self.profile, 0, split + 1);
+                d.cmd_reset_query_pool(self.cmd[1], self.profile, split + 1, stages - split + 1);
+            }
+            ts(self.cmd[0], 0);
+            ts(self.cmd[1], stages + 1);
+        }
         for (st, tab) in tabs.iter().enumerate() {
             let cb = self.cmd[(st >= self.sig.split) as usize];
             // every image stays in general layout, so one global write -> read|write barrier per stage covers them all
@@ -662,6 +667,16 @@ impl Pipeline {
                     }
                 }
             }
+            if self.profile != vk::QueryPool::null() {
+                unsafe {
+                    d.cmd_write_timestamp(
+                        cb,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        self.profile,
+                        st as u32 + 1,
+                    )
+                };
+            }
         }
         for cb in self.cmd {
             check(unsafe { d.end_command_buffer(cb) }, "vkEndCommandBuffer")?;
@@ -669,6 +684,45 @@ impl Pipeline {
         log("  Execution command buffers recorded");
         log("Pipeline build complete");
         Ok(())
+    }
+
+    // milliseconds per stage of the last completed run, waiting for it; none unless profiling
+    pub fn gpu_profile(&self) -> Option<Vec<f64>> {
+        if self.profile == vk::QueryPool::null() {
+            return None;
+        }
+        let d = &self.inst.device;
+        let n = self.stage_labels.len();
+        let mut q = vec![0u64; n + 2];
+        unsafe {
+            d.get_query_pool_results(
+                self.profile,
+                0,
+                &mut q,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }
+        .ok()?;
+        let period = unsafe {
+            self.inst
+                .instance
+                .get_physical_device_properties(self.inst.physical_device)
+        }
+        .limits
+        .timestamp_period as f64;
+        let split = self.sig.split;
+        Some(
+            (0..n)
+                .map(|st| {
+                    let start = match st {
+                        0 => 0,
+                        s if s == split => n + 1,
+                        s => s,
+                    };
+                    q[st + 1].saturating_sub(q[start]) as f64 * period / 1e6
+                })
+                .collect(),
+        )
     }
 
     // host write of the iteration counter
@@ -747,6 +801,9 @@ impl Drop for Pipeline {
     fn drop(&mut self) {
         let d = &self.inst.device;
         unsafe {
+            if self.profile != vk::QueryPool::null() {
+                d.destroy_query_pool(self.profile, None);
+            }
             d.destroy_command_pool(self.cmd_pool, None);
             for &p in &self.pipelines {
                 d.destroy_pipeline(p, None);

@@ -34,13 +34,17 @@ impl Wrapper {
         h: u32,
         hdr: bool,
     ) -> Result<Wrapper, String> {
+        let flow = profile.flow_for(h);
+        if !generator::signature::Signature::new(profile.performance_mode).fits(w, h, flow) {
+            return Err(format!("{w}x{h} is too small to generate frames for"));
+        }
         let ctx = generator::Context::new(
             inst.clone(),
             w,
             h,
-            profile.flow_scale,
+            profile.flow_for(h),
             profile.performance_mode,
-            hdr,
+            if hdr { generator::signature::Colour::HDR } else { generator::signature::Colour::SDR },
         )?;
         let (source, dest, sync) = ctx.handles();
         let fence = vkutil::create_fence(&inst.device)?;
@@ -53,7 +57,7 @@ impl Wrapper {
             sync,
             fence,
             extent: (w, h),
-            built: (profile.flow_scale, profile.performance_mode),
+            built: (profile.flow_for(h), profile.performance_mode),
             iteration: 0,
             remaining: 0,
             sync_counter: 0,
@@ -64,7 +68,7 @@ impl Wrapper {
 
     // true when a reloaded profile changes something the pipeline was built from
     pub fn stale(&self, profile: &Profile) -> bool {
-        self.built != (profile.flow_scale, profile.performance_mode)
+        self.built != (profile.flow_for(self.extent.1), profile.performance_mode)
     }
 
     fn submit(

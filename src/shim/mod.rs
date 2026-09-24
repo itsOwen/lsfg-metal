@@ -267,6 +267,10 @@ pub fn layer() -> Option<&'static Layer> {
 
 impl Layer {
     fn new() -> Result<Option<Layer>, String> {
+        // the kill switch must not read, fail on, or write a config file either
+        if settings::disabled(&settings::os_env) {
+            return Ok(None);
+        }
         let config = settings::load()?;
         let Some((profile, method)) = settings::identify(&config) else {
             // a misspelt LSFGM_PROFILE is the one miss worth reporting; unrelated processes stay quiet
@@ -297,7 +301,11 @@ impl Layer {
         );
         info!("  Pacing: {}", p.pacing_mode.name());
         info!("  Multiplier: {}", p.multiplier);
-        info!("  Flow scale: {:.2}", p.flow_scale);
+        if p.flow_auto {
+            info!("  Flow scale: auto");
+        } else {
+            info!("  Flow scale: {:.2}", p.flow_scale);
+        }
         info!("  Performance mode: {}", p.performance_mode);
         let watcher = settings::os_env("LSFGM_ENV")
             .is_none()
@@ -348,6 +356,9 @@ impl Layer {
         s.profile = i;
         s.revision += 1;
         log::set_level(level(cfg.log_level));
+        if let Some(f) = cfg.log_file.as_ref().filter(|f| Some(*f) != s.config.log_file.as_ref()) {
+            log::set_file(f);
+        }
         s.config = cfg;
         Ok(true)
     }
@@ -1387,10 +1398,14 @@ unsafe extern "system" fn create_swapchain(
                 }
             }
         },
-        None => match native() {
-            Ok(sc) => (sc, None, false),
-            Err(r) => return r,
-        },
+        // nothing has named the old swapchain yet, so this create retires it
+        None => {
+            let mut sc = vk::SwapchainKHR::null();
+            match real(device, ci, alloc, &mut sc) {
+                vk::Result::SUCCESS => (sc, None, false),
+                r => return r,
+            }
+        }
     };
     let Some(destroy) =
         dfetch::<vk::PFN_vkDestroySwapchainKHR>(dev.gdpa, device, c"vkDestroySwapchainKHR")

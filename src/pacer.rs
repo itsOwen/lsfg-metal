@@ -201,7 +201,8 @@ pub fn display_refresh() -> f64 {
     let target = std::env::var("LSFGM_TARGET_FPS")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .filter(|f| f.is_finite() && *f > 0.0);
+        // beyond real displays the pacing math turns seconds into durations that overflow
+        .filter(|f| (1.0..=1000.0).contains(f));
     1.0 / target.unwrap_or_else(|| {
         let fps = main_screen_fps();
         if fps <= 0 {
@@ -220,7 +221,10 @@ fn main_screen_fps() -> isize {
     };
     unsafe {
         let screen: *mut AnyObject = objc2::msg_send![cls, mainScreen];
-        if screen.is_null() {
+        // maximumFramesPerSecond is macos 12 or newer; on 11 the 0 below makes the caller use 60
+        let known: bool = !screen.is_null()
+            && objc2::msg_send![screen, respondsToSelector: objc2::sel!(maximumFramesPerSecond)];
+        if !known {
             0
         } else {
             objc2::msg_send![screen, maximumFramesPerSecond]

@@ -9,7 +9,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Imp, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{define_class, ffi, msg_send, sel, AnyThread, ClassType, DefinedClass, Message};
 use objc2_foundation::NSObject;
-use objc2_core_graphics::{kCGColorSpaceExtendedLinearSRGB, CGColorSpace};
+use objc2_core_graphics::CGColorSpace;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent,
     MTLPixelFormat,
@@ -19,6 +19,7 @@ use objc2_quartz_core::CAMetalLayer;
 use super::drawable::ProxyDrawable;
 use super::generator::{Generator, Job};
 use super::{enabled, now, set_enabled};
+use crate::generator::signature::{Colour, Store};
 use crate::log;
 
 type NextDrawableFn = unsafe extern "C-unwind" fn(*mut CAMetalLayer, Sel) -> *mut AnyObject;
@@ -203,9 +204,11 @@ pub fn forget_surface(surface: vk::SurfaceKHR) {
     }
 }
 
-// supported layer formats (8-bit, 10-bit, and RGBA16F only with an extended linear srgb colour space)
+// every layer format a game can present, with the colour space deciding only the colour kind; None presents natively
 pub(crate) fn layer_supported(layer: &CAMetalLayer) -> bool {
-    let ok = format_supported(layer);
+    // the xr formats need the native generator; with it switched off they present natively like any unsupported format
+    let ok = colour(layer.pixelFormat(), layer.colorspace().as_deref())
+        .is_some_and(|c| c.store != Store::Bgr10Xr || !super::generator::native_off());
     if !ok {
         // warn once per format and colour space, nextDrawable runs every frame
         static SEEN: Mutex<Vec<(usize, Option<String>)>> = Mutex::new(Vec::new());
@@ -225,19 +228,34 @@ pub(crate) fn layer_supported(layer: &CAMetalLayer) -> bool {
     ok
 }
 
-fn format_supported(layer: &CAMetalLayer) -> bool {
-    match layer.pixelFormat() {
+// storage that keeps the layer's precision at 32 bits a pixel, and the colour kind from whether its colour space is linear
+pub(crate) fn colour(format: MTLPixelFormat, space: Option<&CGColorSpace>) -> Option<Colour> {
+    let (linear, extended) = space.map_or((false, false), |s| {
+        // a linear space linearizes to itself; the legacy generic linear one comes back unnamed, so its name decides
+        let named = CGColorSpace::name(Some(s)).is_some_and(|n| n.to_string().contains("Linear"));
+        (named || s.linearized().is_some_and(|l| &*l == s), s.uses_extended_range())
+    });
+    let kind = match (linear, extended) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    };
+    let store = match format {
         MTLPixelFormat::BGRA8Unorm
         | MTLPixelFormat::BGRA8Unorm_sRGB
         | MTLPixelFormat::RGBA8Unorm
-        | MTLPixelFormat::RGBA8Unorm_sRGB
-        | MTLPixelFormat::RGB10A2Unorm => true,
-        MTLPixelFormat::RGBA16Float => {
-            let name = CGColorSpace::name(layer.colorspace().as_deref()).map(|n| n.to_string());
-            name.as_deref() == Some(&unsafe { kCGColorSpaceExtendedLinearSRGB }.to_string())
-        }
-        _ => false,
-    }
+        | MTLPixelFormat::RGBA8Unorm_sRGB => Store::Rgba8,
+        MTLPixelFormat::RGB10A2Unorm | MTLPixelFormat::BGR10A2Unorm => Store::Rgb10a2,
+        MTLPixelFormat::BGR10_XR
+        | MTLPixelFormat::BGR10_XR_sRGB
+        | MTLPixelFormat::BGRA10_XR
+        | MTLPixelFormat::BGRA10_XR_sRGB => Store::Bgr10Xr,
+        // linear hdr keeps half float, as it always has; encoded float needs range above 1 but not half float's cost
+        MTLPixelFormat::RGBA16Float if kind == 2 => Store::Rgba16f,
+        MTLPixelFormat::RGBA16Float => Store::Rgb9e5,
+        _ => return None,
+    };
+    Some(Colour { store, kind })
 }
 
 // hand the game one of our drawables instead of the layer's real one
@@ -388,5 +406,39 @@ unsafe extern "C-unwind" fn commit_hook(this: *mut AnyObject, sel: Sel) {
     }
     if !IS_WORKER.with(|w| w.get()) {
         let _ = LAST_COMMITTED.try_with(|c| *c.borrow_mut() = Some(cb.retain()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::colour;
+    use crate::generator::signature::{Colour, Store};
+    use objc2_core_graphics::*;
+    use objc2_metal::MTLPixelFormat;
+
+    #[test]
+    fn layer_formats_keep_their_precision_and_linear_light_picks_the_kind() {
+        let c = |f, name: Option<&objc2_core_foundation::CFString>| {
+            let space = name.and_then(|n| CGColorSpace::with_name(Some(n)));
+            colour(f, space.as_deref())
+        };
+        let s = |store, kind| Some(Colour { store, kind });
+        unsafe {
+            assert_eq!(c(MTLPixelFormat::BGRA8Unorm, None), Some(Colour::SDR));
+            assert_eq!(c(MTLPixelFormat::BGRA8Unorm_sRGB, Some(kCGColorSpaceSRGB)), Some(Colour::SDR));
+            assert_eq!(c(MTLPixelFormat::RGB10A2Unorm, Some(kCGColorSpaceSRGB)), s(Store::Rgb10a2, 0));
+            assert_eq!(c(MTLPixelFormat::BGR10A2Unorm, Some(kCGColorSpaceITUR_2100_PQ)), s(Store::Rgb10a2, 0));
+            // scrgb stays exactly as before: half float and the hdr kind
+            assert_eq!(c(MTLPixelFormat::RGBA16Float, Some(kCGColorSpaceExtendedLinearSRGB)), Some(Colour::HDR));
+            assert_eq!(c(MTLPixelFormat::RGBA16Float, Some(kCGColorSpaceExtendedLinearDisplayP3)), Some(Colour::HDR));
+            // gamma-encoded float, as unity presents it: range above 1 at 32 bits a pixel
+            assert_eq!(c(MTLPixelFormat::RGBA16Float, Some(kCGColorSpaceExtendedSRGB)), s(Store::Rgb9e5, 0));
+            assert_eq!(c(MTLPixelFormat::RGBA16Float, Some(kCGColorSpaceITUR_2100_PQ)), s(Store::Rgb9e5, 0));
+            assert_eq!(c(MTLPixelFormat::RGBA16Float, Some(kCGColorSpaceLinearSRGB)), s(Store::Rgb9e5, 1));
+            assert_eq!(c(MTLPixelFormat::RGBA16Float, Some(kCGColorSpaceGenericRGBLinear)), s(Store::Rgb9e5, 1));
+            assert_eq!(c(MTLPixelFormat::BGR10_XR_sRGB, Some(kCGColorSpaceExtendedSRGB)), s(Store::Bgr10Xr, 0));
+            assert_eq!(c(MTLPixelFormat::BGRA10_XR, Some(kCGColorSpaceExtendedDisplayP3)), s(Store::Bgr10Xr, 0));
+            assert_eq!(c(MTLPixelFormat::R8Unorm, None), None);
+        }
     }
 }

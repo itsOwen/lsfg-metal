@@ -3,3 +3,6 @@ target = "x86_64-apple-darwin"
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "11.0"
+# spirv-cross release builds define it; its asserts would abort the game
+CXXFLAGS_x86_64_apple_darwin = "-DNDEBUG"
+CXXFLAGS_aarch64_apple_darwin = "-DNDEBUG"

@@ -202,6 +202,9 @@ impl Library {
             if words.len() < 5 || words[0] != 0x0723_0203 {
                 return Err(format!("Shader '{name}' in the DLL is not SPIR-V"));
             }
+            // moltenvk's parser crashes on a malformed module, so it is parsed here first
+            spirv_cross2::Compiler::<spirv_cross2::targets::Msl>::new(spirv_cross2::Module::from_words(words))
+                .map_err(|e| format!("Shader '{name}' in the DLL is not valid SPIR-V: {e}"))?;
             let info = vk::ShaderModuleCreateInfo::default().code(words);
             let m = check(
                 unsafe { device.create_shader_module(&info, None) },

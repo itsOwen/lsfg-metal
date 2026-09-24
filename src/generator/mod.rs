@@ -1,4 +1,5 @@
 // generator library: instance (own / adopt) and context with the timeline protocol
+pub mod native;
 pub mod pipeline;
 pub mod signature;
 
@@ -11,6 +12,7 @@ use ash::{khr, vk};
 use crate::shaders;
 use crate::vkutil::{self, check};
 use pipeline::Pipeline;
+use signature::Colour;
 
 pub type LogFn = fn(&str);
 
@@ -231,9 +233,9 @@ impl Context {
         h: u32,
         flow: f32,
         perf: bool,
-        hdr: bool,
+        colour: Colour,
     ) -> Result<Context, String> {
-        let pipeline = Pipeline::new(inst.clone(), w, h, flow, perf, hdr)?;
+        let pipeline = Pipeline::new(inst.clone(), w, h, flow, perf, colour)?;
         let d = &inst.device;
         let (sync, internal, fence) = (
             vkutil::create_semaphore(d, true)?,

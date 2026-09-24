@@ -95,10 +95,10 @@ impl ProxySwapchain {
                 p = (*p).p_next;
             }
         }
-        if info
-            .flags
-            .contains(!vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
-        {
+        // the proxy owns its images, so deferred allocation is moot; any other flag needs the real swapchain
+        let allowed = vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT
+            | vk::SwapchainCreateFlagsKHR::DEFERRED_MEMORY_ALLOCATION_EXT;
+        if !(info.flags & !allowed).is_empty() {
             return Ok(None);
         }
         // the layer must be able to present the swapchain format

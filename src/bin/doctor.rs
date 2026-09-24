@@ -170,6 +170,8 @@ fn check_dyld(r: &mut Report) {
 
 // version and the extension the Metal paths need, from the driver itself
 fn check_driver(r: &mut Report, real: &Path) {
+    // set when the driver loads but is too old or lacks metal_objects, which limits generation on moltenvk only
+    let limited = std::cell::Cell::new(false);
     let run = || -> Result<String, String> {
         let (_lib, entry) = vkutil::load_driver(real)?;
         let instance =
@@ -177,7 +179,7 @@ fn check_driver(r: &mut Report, real: &Path) {
         let out = (|| {
             let pd = vkutil::select_physical_device(&instance, "")?;
             let gipa = entry.static_fn().get_instance_proc_addr;
-            vkutil::check_driver(gipa, instance.handle(), pd)?;
+            vkutil::check_driver(gipa, instance.handle(), pd).inspect_err(|_| limited.set(true))?;
             let exts = vkutil::check(
                 unsafe { instance.enumerate_device_extension_properties(pd) },
                 "vkEnumerateDeviceExtensionProperties",
@@ -186,7 +188,8 @@ fn check_driver(r: &mut Report, real: &Path) {
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::metal_objects::NAME));
             if !metal {
-                return Err("the driver has no VK_EXT_metal_objects, so the Metal and proxy paths cannot import textures".into());
+                limited.set(true);
+                return Err("the driver has no VK_EXT_metal_objects, so the proxy path and generation on MoltenVK cannot import textures".into());
             }
             let mut props = vk::PhysicalDeviceProperties2::default();
             unsafe { instance.get_physical_device_properties2(pd, &mut props) };
@@ -204,7 +207,17 @@ fn check_driver(r: &mut Report, real: &Path) {
         unsafe { instance.destroy_instance(None) };
         out
     };
-    r.res("driver", run());
+    // the native generator needs neither, so on apple silicon those two only limit moltenvk
+    let native = std::env::var_os("LSFGM_NATIVE").is_none_or(|v| v != "0")
+        && objc2_metal::MTLCreateSystemDefaultDevice()
+            .is_some_and(|d| objc2_metal::MTLDevice::supportsFamily(&*d, objc2_metal::MTLGPUFamily::Apple7));
+    match run() {
+        Err(e) if native && limited.get() => r.warn(
+            "driver",
+            &format!("{e}; the native Metal generator does not need it, so Metal and OpenGL games and Vulkan games on the proxy can still generate"),
+        ),
+        res => r.res("driver", res),
+    }
 }
 
 // the shader package: found, parsable, and the frame-generation build rather than the DXBC one
@@ -285,22 +298,25 @@ fn check_entitlements(r: &mut Report, app: &Path) {
             &format!("{}: no flag blocks injection", app.display()),
         );
     }
-    // measured: cemu is hardened with only disable-library-validation and still takes an insert
-    let waived = [
-        "disable-library-validation",
-        "allow-dyld-environment-variables",
-    ]
-    .iter()
-    .any(|k| entitled(&ents, k));
     if flags.contains("restrict") {
-        r.fail(
+        return r.fail(
             "entitlements",
             &format!(
                 "{} is signed restrict, which no entitlement can waive; DYLD_INSERT_LIBRARIES is dropped on exec",
                 app.display()
             ),
         );
-    } else if waived {
+    }
+    // measured on macos 27: hardened needs allow-dyld-environment-variables or get-task-allow and disable-library-validation
+    let hardened = flags.contains("runtime");
+    let mut missing = vec![];
+    if hardened && !["allow-dyld-environment-variables", "get-task-allow"].iter().any(|k| entitled(&ents, k)) {
+        missing.push("allow-dyld-environment-variables (or get-task-allow)");
+    }
+    if (hardened || flags.contains("library-validation")) && !entitled(&ents, "disable-library-validation") {
+        missing.push("disable-library-validation");
+    }
+    if missing.is_empty() {
         r.ok(
             "entitlements",
             &format!(
@@ -313,9 +329,10 @@ fn check_entitlements(r: &mut Report, app: &Path) {
         r.fail(
             "entitlements",
             &format!(
-                "{} is signed {} without disable-library-validation or allow-dyld-environment-variables; DYLD_INSERT_LIBRARIES is dropped on exec",
+                "{} is signed {} without {}; the shim is not injected",
                 app.display(),
-                blocking.join(" + ")
+                blocking.join(" + "),
+                missing.join(" and ")
             ),
         );
     }
@@ -408,7 +425,7 @@ fn main() {
     let disabled = settings::disabled(&settings::os_env);
     std::env::set_var("LSFGM_DISABLE", "1");
     let mut shim = None;
-    let mut dll = env("LSFGM_DLL_PATH").map(PathBuf::from);
+    let mut dll = None;
     let mut app = None;
     let mut args = std::env::args_os()
         .skip(1)
@@ -451,7 +468,13 @@ fn main() {
         Some(real) => check_driver(&mut r, &real),
         None => r.warn("driver", "not checked: no real driver to load"),
     }
-    check_dll(&mut r, dll.or_else(shaders::find_dll));
+    // the shim's own order: the config's dll (which LSFGM_DLL_PATH overrides), the path fix-up, then discovery
+    let dll = dll
+        .or_else(|| settings::load().ok().and_then(|c| c.dll).map(PathBuf::from))
+        .or_else(|| env("LSFGM_DLL_PATH").map(PathBuf::from))
+        .map(|d| shaders::fix_dll_path(&d))
+        .or_else(shaders::find_dll);
+    check_dll(&mut r, dll);
     check_cache(&mut r);
     check_profile(&mut r, disabled);
     if let Some(app) = app {

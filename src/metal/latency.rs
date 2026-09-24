@@ -51,6 +51,14 @@ pub enum Kind {
 #[derive(Default)]
 pub struct Probe {
     batches: Mutex<[Batch; 3]>,
+    display: Mutex<Display>,
+}
+
+// on-screen intervals between consecutive presents of any kind
+#[derive(Default)]
+struct Display {
+    last: f64,
+    intervals: Vec<f64>,
 }
 
 #[derive(Default)]
@@ -74,6 +82,19 @@ impl Probe {
         let submitted = clock();
         let block = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
             let displayed = unsafe { d.as_ref() }.presentedTime();
+            if displayed.is_finite() && displayed > 0.0 {
+                let mut disp = self.display.lock().unwrap();
+                if disp.last > 0.0 && displayed > disp.last {
+                    let dt = (displayed - disp.last) * 1000.0;
+                    disp.intervals.push(dt);
+                }
+                disp.last = displayed;
+                if disp.intervals.len() >= 240 {
+                    let v = std::mem::take(&mut disp.intervals);
+                    drop(disp);
+                    log::info(&display_line(v));
+                }
+            }
             let batch = {
                 let mut batches = self.batches.lock().unwrap();
                 let batch = &mut batches[kind as usize];
@@ -119,6 +140,19 @@ impl Probe {
         });
         unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&block)) };
     }
+}
+
+// median, p95, stdev and frames held past 1.5 median intervals
+fn display_line(v: Vec<f64>) -> String {
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    let sd = (v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n).sqrt();
+    let (p50, p95) = percentiles(v.clone()).unwrap_or_default();
+    let late = v.iter().filter(|&&x| x > p50 * 1.5).count();
+    format!(
+        "Metal display intervals={} p50_ms={p50:.3} p95_ms={p95:.3} stdev_ms={sd:.3} late={late}",
+        v.len()
+    )
 }
 
 fn percentiles(mut values: Vec<f64>) -> Option<(f64, f64)> {
