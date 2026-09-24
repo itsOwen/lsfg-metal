@@ -258,46 +258,23 @@ impl ProxySwapchain {
             log::debug(&format!("Vulkan proxy acquire out of date: invalid {} layer {}x{} extent {}x{}", s.invalid, natural.0, natural.1, self.extent.0, self.extent.1));
             return vk::Result::ERROR_OUT_OF_DATE_KHR;
         }
-        let start = Instant::now();
-        let deadline = start + Duration::from_nanos(timeout.min(i64::MAX as u64));
-        // the cap is a low_latency setting; without it a swapchain may use every image it has
-        let limited = super::setup().is_some_and(|s| s.profile.low_latency);
+        let deadline = Instant::now() + Duration::from_nanos(timeout.min(i64::MAX as u64));
         let i = loop {
-            let free = s.status.iter().position(|&st| st == Status::Free);
-            let busy = s.status.iter().filter(|&&st| st != Status::Free).count();
-            // a free image held back only by the cap is re-checked; the cap gives way once the wait runs long
-            let capped = limited && free.is_some() && busy >= self.gen.pool_cap(start.elapsed());
-            if let (Some(i), false) = (free, capped) {
+            if let Some(i) = s.status.iter().position(|&st| st == Status::Free) {
                 break i;
             }
-            // a caller that cannot wait out the patience would be held at two for good; give it the image
-            let give = || free.filter(|_| capped && busy < self.gen.pool_cap(Duration::MAX));
             if timeout == 0 {
-                match give() {
-                    Some(i) => break i,
-                    None => return vk::Result::NOT_READY,
-                }
+                return vk::Result::NOT_READY;
             }
-            let slice = if capped {
-                Duration::from_millis(10)
-            } else {
-                Duration::MAX
-            };
             if timeout == u64::MAX {
-                s = match slice {
-                    Duration::MAX => cv.wait(s).unwrap(),
-                    d => cv.wait_timeout(s, d).unwrap().0,
-                };
+                s = cv.wait(s).unwrap();
                 continue;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                match give() {
-                    Some(i) => break i,
-                    None => return vk::Result::TIMEOUT,
-                }
+                return vk::Result::TIMEOUT;
             }
-            s = cv.wait_timeout(s, left.min(slice)).unwrap().0;
+            s = cv.wait_timeout(s, left).unwrap().0;
         };
         s.status[i] = Status::Acquired;
         s.blocked += now() - t0;

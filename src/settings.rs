@@ -78,7 +78,6 @@ pub struct Profile {
     pub performance_mode: bool,
     pub override_present_mode: bool,
     pub preserve_swapchain_image_count: bool,
-    pub low_latency: bool,
 }
 
 impl Profile {
@@ -108,7 +107,6 @@ impl Default for Profile {
             performance_mode: false,
             override_present_mode: true,
             preserve_swapchain_image_count: false,
-            low_latency: false,
         }
     }
 }
@@ -222,9 +220,6 @@ fn env_profile(env: Env) -> Result<Profile, String> {
     }
     if let Some(v) = nonempty(env, "LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT") {
         p.preserve_swapchain_image_count = v == "1";
-    }
-    if let Some(v) = nonempty(env, "LSFGM_LOW_LATENCY") {
-        p.low_latency = v == "1";
     }
     if p.multiplier > 4 {
         return Err("The macOS shim supports multipliers from 2 to 4".into());
@@ -485,7 +480,6 @@ pub fn parse(text: &str, env: Env) -> Result<Config, String> {
                     "preserve_swapchain_image_count" => {
                         p.preserve_swapchain_image_count = as_bool(val, key)?
                     }
-                    "low_latency" => p.low_latency = as_bool(val, key)?,
                     _ => return Err(format!("Unknown key in profile section: {key}")),
                 }
             }
@@ -566,10 +560,6 @@ pub fn to_toml(cfg: &Config) -> String {
             p.override_present_mode,
             p.preserve_swapchain_image_count
         );
-        // written only when on, so an older shim sharing the file still reads it
-        if p.low_latency {
-            let _ = writeln!(out, "low_latency = true");
-        }
     }
     out
 }
@@ -820,8 +810,6 @@ mod tests {
         // spaces around auto are fine, as around a number
         let e = env(&[("LSFGM_ENV", "1"), ("LSFGM_FLOW_SCALE", " auto ")]);
         assert!(load_with(&e).unwrap().profiles[0].flow_auto);
-        // low_latency is written only when on, so an older shim can still read a default file
-        assert!(!to_toml(&Config::builtin()).contains("low_latency"));
         // the last of two flow_scale keys wins, auto or not
         let t = "version = 2\n[global]\n[[profile]]\nflow_scale = \"auto\"\nflow_scale = 0.5\n";
         let p = &parse(t, &env(&[])).unwrap().profiles[0];
@@ -850,10 +838,9 @@ mod tests {
             ("LSFGM_ENV", "1"),
             ("LSFGM_PERFORMANCE_MODE", "yes"),
             ("LSFGM_PACING_MODE", "None"),
-            ("LSFGM_LOW_LATENCY", "1"),
         ]);
         let p = &load_with(&e).unwrap().profiles[0];
-        assert!(!p.performance_mode && p.low_latency);
+        assert!(!p.performance_mode);
         assert_eq!(p.pacing_mode, PacingMode::Vsync);
     }
 

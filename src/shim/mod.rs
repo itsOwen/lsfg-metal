@@ -303,7 +303,6 @@ impl Layer {
             info!("  Flow scale: {:.2}", p.flow_scale);
         }
         info!("  Performance mode: {}", p.performance_mode);
-        info!("  Low latency: {}", p.low_latency);
         let watcher = settings::os_env("LSFGM_ENV")
             .is_none()
             .then(|| settings::Watcher::new(settings::config_path(&settings::os_env)));

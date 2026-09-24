@@ -290,7 +290,6 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_PACING_MODE` | pacing | `vsync` or `none` (fixed), `adaptive`; matched case-insensitively | `vsync` |
 | `LSFGM_OVERRIDE_PRESENT_MODE` | force vsync: FIFO on wrapped swapchains, `displaySyncEnabled` on Metal layers; `0` leaves the game's own present mode and display sync in place on every path | `1` is true, other non-empty is false | true |
 | `LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT` | keep the game's image count | `1` is true, other non-empty is false | false |
-| `LSFGM_LOW_LATENCY` | shorter present queue on the Metal path and the proxy swapchain (see below) | `1` is true, other non-empty is false | false |
 | `LSFGM_DLL_PATH` | path to `lsfg-vk.dll` | path | unset, see discovery below |
 | `LSFGM_NO_FP16` | disable half precision | `allow_fp16 = (value != "1")` | unset, fp16 allowed |
 | `LSFGM_LOG_LEVEL` | log level | `debug`, `info`, `warning`, `error` | `info` |
@@ -324,9 +323,9 @@ therefore means false.
 
 Of the settings variables, file mode reads only `LSFGM_DLL_PATH`, `LSFGM_NO_FP16`,
 `LSFGM_LOG_LEVEL` and `LSFGM_LOG_FILE`; they override the file's `[global]` values, also after a
-reload. The profile variables (`LSFGM_MULTIPLIER` through `LSFGM_LOW_LATENCY`) are ignored without
-`LSFGM_ENV`. `~` is not expanded in any environment variable; only the file's `dll` and `log_file`
-get that.
+reload. The profile variables (`LSFGM_MULTIPLIER` through `LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT`)
+are ignored without `LSFGM_ENV`. `~` is not expanded in any environment variable; only the file's
+`dll` and `log_file` get that.
 
 Also consulted: `XDG_CONFIG_HOME` and `HOME` for the config path; `SteamAppId` and the process's
 own command line for profile selection; `HOME` and `WINEPREFIX` for DLL discovery; `HOME` and
@@ -386,8 +385,7 @@ override_present_mode = true
 preserve_swapchain_image_count = false
 ```
 
-`dll` and `log_file` appear in `[global]` only when set (`~` is expanded on read), and
-`low_latency = true` only when on, so a file written by this version still loads in an older one; `active_in` is a
+`dll` and `log_file` appear in `[global]` only when set (`~` is expanded on read); `active_in` is a
 string for one entry, an array for several, and omitted for none. `pacing` is accepted as an alias for
 `pacing_mode`, a `# comment` after any value is accepted, and a key that appears twice takes the
 last value, also for `flow_scale` when one of the two is `"auto"`.
@@ -430,25 +428,6 @@ cost. On an M2 at 2940x1846 (a Retina panel at native resolution) one generated 
 mode costs, on the MoltenVK generator, 23.4 ms at 1.0, 12.4 ms at 0.62 and 9.3 ms at 0.5; auto picks
 0.59 there, which takes 8.5 ms on the native generator. It is chosen again whenever the context is
 rebuilt for a new size.
-
-`low_latency` (Metal path and Vulkan proxy swapchain, fixed pacing, off by default). A game and a
-display that run at the same rate never drain a frame that got stuck in the present queue, and a
-game that runs ahead of the display fills every drawable it may hold. With `low_latency` on, a game
-running at the display-locked rate (refresh divided by the multiplier) may hold two drawables
-instead of three, going back to three for good if two ever slow it down, and one generated frame is
-skipped when the first generated frame of each source frame keeps waiting for a drawable while the
-source runs at that rate. Skips wait 60 source frames after any change of the drawable count, and a
-skip that does not shorten the latency is retried once, 60 windows of 30 originals later (a minute
-at 30 fps), and then never again for that layer. A game that waits on two drawables for longer than
-four display-locked intervals, for example one that acquires twice before it presents, gets the
-third back for good. On an M2 Air at 60 Hz, on the MoltenVK generator, this took commit-to-display
-of original frames from 99.5 to 66.2 ms in Codename CURE II with DXMT and from 98.9 to 65.6 ms with
-DXVK (2x), from 149 to 99 ms uncapped at 3x (99 ms again on the native generator), and from 99 to
-65.6 ms in the `mtlclear` smoke test at 30 fps. The cost is power when the GPU is near its limit:
-with less work queued it runs at higher clocks for shorter bursts.
-In the same Codename scene with DXMT the GPU did the same work at 1110 to 1236 MHz instead of 612 to
-808 MHz, and its power rose from about 3.5 to about 5.1 W (with DXVK it did not rise, 2.5 to 2.3 W).
-Turn it on when latency matters more than battery and heat. Adaptive pacing is unaffected.
 
 Profile selection order:
 
@@ -549,7 +528,6 @@ At startup the shim logs the version, the profile and its settings:
 (lsfg-metal) [INFO]:   Multiplier: 4
 (lsfg-metal) [INFO]:   Flow scale: 1.00
 (lsfg-metal) [INFO]:   Performance mode: false
-(lsfg-metal) [INFO]:   Low latency: false
 ```
 
 With `flow_scale = "auto"` the flow line reads `Flow scale: auto`.
@@ -697,7 +675,7 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 37 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
+**Unit tests.** 36 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, simple
 fractions ending on the original, cap behaviour, untrusted runs and probing, a present thread
@@ -708,8 +686,7 @@ error messages, profile identification order including the kill switch, executab
 and the catch-all profile, reload on mtime change), the refresh-interval conversion, the PE resource
 walk, the DLL path fix-up, the feature-chain copy, memory type selection, the memory planner, the
 pipeline signature tables, the 64-pixel minimum frame size, the recursive mutex, half-float
-conversion, the latency probe's percentiles, the present queue governor's skip and backoff, and the
-OpenGL state restore.
+conversion, the latency probe's percentiles and the OpenGL state restore.
 
 **`validate`.** Runs the generator on a real driver with synthetic input and reports timings and the
 centre pixel of the last generated frame.
