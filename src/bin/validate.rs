@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ash::vk;
-use lsfg_metal::generator::signature::Colour;
+use lsfg_metal::generator::signature::{Colour, Store};
 use lsfg_metal::generator::{Context, Instance};
 use lsfg_metal::vkutil::{self, check};
 use lsfg_metal::{log, shaders};
@@ -87,6 +87,7 @@ struct Run {
     perf: bool,
     fp16: bool,
     hdr: bool,
+    store: Option<Store>,
 }
 
 // the same run on the native metal generator: one command buffer per iteration, one iteration in flight; there is no caller sync to drop, so --bench changes nothing here
@@ -106,7 +107,9 @@ fn run_native(
     let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
     let queue = device.newCommandQueue().ok_or("no Metal queue")?;
     let t0 = Instant::now();
-    let mut p = Pipeline::new(&device, res, r.fp16, (w, h), r.flow, r.perf, if r.hdr { Colour::HDR } else { Colour::SDR }, relog)?;
+    // --store picks the storage of the source and generated images; the frames go in and out in the input format either way
+    let colour = Colour { store: r.store.unwrap_or(if r.hdr { Store::Rgba16f } else { Store::Rgba8 }), kind: if r.hdr { 2 } else { 0 } };
+    let mut p = Pipeline::new(&device, res, r.fp16, (w, h), r.flow, r.perf, colour, relog)?;
     let build = t0.elapsed();
     let bpp = if r.hdr { 8 } else { 4 };
     let len = w as usize * h as usize * bpp;
@@ -194,10 +197,11 @@ fn run_native(
         }
     }
     let cb = queue.commandBuffer().ok_or("no Metal command buffer")?;
+    p.copy_out(&cb, &targets[0])?;
     let blit = cb.blitCommandEncoder().ok_or("no blit encoder")?;
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-            p.destination(), 0, 0, origin, size, &reads[0], 0, w as usize * bpp, len,
+            &targets[0], 0, 0, origin, size, &reads[0], 0, w as usize * bpp, len,
         )
     };
     blit.endEncoding();
@@ -226,7 +230,7 @@ fn run_native(
 fn run() -> Result<(), String> {
     let (mut w, mut h, mut m, mut flow, mut iters) = (1920u32, 1080u32, 2u32, 1.0f32, 10u32);
     let (mut perf, mut fp16, mut hdr, mut partial) = (false, true, false, false);
-    let (mut bench, mut native, mut input, mut out) = (false, false, None, None);
+    let (mut bench, mut native, mut input, mut out, mut store) = (false, false, None, None, None);
     let mut driver = env("LSFGM_MOLTENVK").map(PathBuf::from);
     let mut dll = env("LSFGM_DLL_PATH")
         .map(PathBuf::from)
@@ -248,9 +252,19 @@ fn run() -> Result<(), String> {
             "--partial" => partial = true,
             "--bench" => bench = true,
             "--native" => native = true,
+            "--store" => {
+                store = Some(match val()?.as_str() {
+                    "rgba8" => Store::Rgba8,
+                    "rgb10a2" => Store::Rgb10a2,
+                    "rgb9e5" => Store::Rgb9e5,
+                    "bgr10xr" => Store::Bgr10Xr,
+                    "rgba16f" => Store::Rgba16f,
+                    _ => return Err("--store is rgba8, rgb10a2, rgb9e5, bgr10xr or rgba16f".into()),
+                })
+            }
             "--in" => input = Some((PathBuf::from(val()?), PathBuf::from(val()?))),
             "--out" => out = Some(PathBuf::from(val()?)),
-            _ => return Err("usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow] [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench] [--native] [--in a.ppm b.ppm] [--out dir]".into()),
+            _ => return Err("usage: validate [--driver dylib] [--dll lsfg-vk.dll] [-w W] [-h H] [-m M] [-f flow] [-n iterations] [-p] [--no-fp16] [--hdr] [--partial] [--bench] [--native [--store rgba8|rgb10a2|rgb9e5|bgr10xr|rgba16f]] [--in a.ppm b.ppm] [--out dir]".into()),
         }
     }
     if !(2..=4).contains(&m) || !(0.25..=1.0).contains(&flow) {
@@ -289,13 +303,16 @@ fn run() -> Result<(), String> {
     if !lsfg_metal::generator::signature::Signature::new(perf).fits(w, h, flow) {
         return Err(format!("{w}x{h} at flow {flow} is below the 64 pixel minimum after flow scaling"));
     }
+    if store.is_some() && !native {
+        return Err("--store picks the native generator's storage; it needs --native".into());
+    }
     if native && partial {
         return Err("--partial tests the Vulkan context; it does not apply to --native".into());
     }
     let dll = dll.ok_or("no dll: pass --dll or set LSFGM_DLL_PATH")?;
     if native {
         let res = shaders::parse(&std::fs::read(&dll).map_err(|e| format!("{}: {e}", dll.display()))?)?;
-        let run = Run { w, h, m, flow, iters, perf, fp16, hdr };
+        let run = Run { w, h, m, flow, iters, perf, fp16, hdr, store };
         return run_native(&run, &res, frames.as_ref().map(|f| &f.1), out.as_deref());
     }
     let driver = driver.ok_or("no driver: pass --driver or set LSFGM_MOLTENVK")?;
