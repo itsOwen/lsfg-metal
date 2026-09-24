@@ -267,6 +267,10 @@ pub fn layer() -> Option<&'static Layer> {
 
 impl Layer {
     fn new() -> Result<Option<Layer>, String> {
+        // the kill switch must not read, fail on, or write a config file either
+        if settings::disabled(&settings::os_env) {
+            return Ok(None);
+        }
         let config = settings::load()?;
         let Some((profile, method)) = settings::identify(&config) else {
             // a misspelt LSFGM_PROFILE is the one miss worth reporting; unrelated processes stay quiet
