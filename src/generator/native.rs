@@ -70,6 +70,17 @@ fn pixel_format(f: vk::Format) -> Result<MTLPixelFormat, String> {
     })
 }
 
+// kernels write any format, so the source and generated images take the storage that keeps the game's precision
+fn store_format(s: Store) -> MTLPixelFormat {
+    match s {
+        Store::Rgba8 => MTLPixelFormat::RGBA8Unorm,
+        Store::Rgb10a2 => MTLPixelFormat::RGB10A2Unorm,
+        Store::Rgb9e5 => MTLPixelFormat::RGB9E5Float,
+        Store::Bgr10Xr => MTLPixelFormat::BGR10_XR,
+        Store::Rgba16f => MTLPixelFormat::RGBA16Float,
+    }
+}
+
 // spirv-cross output for one shader: its source, threadgroup size and texture slots
 #[derive(Clone)]
 struct Translated {
@@ -203,7 +214,7 @@ pub struct Pipeline {
     pub sig: Signature,
     pub extent: (u32, u32),
     pub flow: f32,
-    pub hdr: bool,
+    pub colour: Colour,
     kernels: Vec<Kernel>,
     images: Vec<Vec<Texture>>,
     _heaps: Vec<Retained<ProtocolObject<dyn MTLHeap>>>,
@@ -227,7 +238,7 @@ impl Pipeline {
         (w, h): (u32, u32),
         flow: f32,
         perf: bool,
-        hdr: bool,
+        colour: Colour,
         log: fn(&str),
     ) -> Result<Pipeline, String> {
         log(&format!(
@@ -244,7 +255,7 @@ impl Pipeline {
                     // spawn would panic, and so abort the game, when no thread can be made
                     std::thread::Builder::new().spawn_scoped(s, move || {
                         let name = match sh {
-                            GEN if hdr => "generate_16bit",
+                            GEN if colour.float() => "generate_16bit",
                             GEN => "generate_8bit",
                             _ => SHADERS[sh],
                         };
@@ -279,7 +290,7 @@ impl Pipeline {
                 } else {
                     MTLTextureType::Type2D
                 });
-                d.setPixelFormat(pixel_format(im.format(hdr))?);
+                d.setPixelFormat(if im.is(H) { store_format(colour.store) } else { pixel_format(im.format(false))? });
                 d.setWidth(x as usize);
                 d.setHeight(y as usize);
                 d.setArrayLength(im.layers() as usize);
@@ -383,7 +394,7 @@ impl Pipeline {
             device: device.retain(),
             extent: (w, h),
             flow,
-            hdr,
+            colour,
             kernels,
             images,
             _heaps: heaps,
@@ -392,8 +403,8 @@ impl Pipeline {
             block: [
                 0,
                 0,
-                if hdr { 2 } else { 0 },
-                hdr as u32,
+                colour.block()[0],
+                colour.block()[1],
                 (1.0 / flow).to_bits(),
                 0.5f32.to_bits(),
             ],

@@ -43,17 +43,33 @@ Three hooks cover the renderers a Wine bottle can use:
 * Pacing: fixed (`vsync`, evenly spaced timestamps `1/m .. m/m`) and adaptive (the pacer fits
   generated frames to display slots).
 * Performance mode (the performance shader set) and flow scale 0.25 to 1.0, or `auto`.
-* SDR formats: single-layer 8-bit RGBA8/BGRA8 (unorm or sRGB), 10-bit `A2B10G10R10` /
-  `A2R10G10B10` (what Unreal Engine games present) and, on the Vulkan path, `R16G16B16A16_SFLOAT`
-  in sRGB. On the Metal path: BGRA8/RGBA8, `RGB10A2Unorm` and `BGR10A2Unorm` layers.
-* HDR: linear scRGB, Vulkan `R16G16B16A16_SFLOAT` with `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
-  and `CAMetalLayer`s in `RGBA16Float` with `kCGColorSpaceExtendedLinearSRGB`. On the Vulkan path
-  also HDR10: 10-bit with `VK_COLOR_SPACE_HDR10_ST2084_EXT`.
-* Generated frames of 10-bit and float sources pass through 8-bit images, so they can band slightly
-  in smooth gradients; the game's own frames are untouched. sRGB sources are copied as their encoded
-  bytes on the Metal path and the proxy swapchain; the Vulkan fixed present path still converts them
-  to linear 8-bit, which crushes dark tones in generated frames. Any other format keeps native
-  presentation and the log names its format and colour space.
+* Vulkan path: single-layer 8-bit RGBA8/BGRA8 (unorm or sRGB), 10-bit `A2B10G10R10` /
+  `A2R10G10B10` (what Unreal Engine games present), `R16G16B16A16_SFLOAT` in sRGB, linear scRGB
+  (`R16G16B16A16_SFLOAT` with `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`) and HDR10 (10-bit with
+  `VK_COLOR_SPACE_HDR10_ST2084_EXT`).
+* Metal path: `CAMetalLayer`s in BGRA8/RGBA8 (unorm or sRGB), `RGB10A2Unorm`, `BGR10A2Unorm`,
+  `RGBA16Float` and the `BGR10_XR`/`BGRA10_XR` formats (sRGB or not), in any colour space; other
+  pixel formats present natively. The XR formats need the native generator, which MoltenVK cannot
+  stand in for, so with `LSFGM_NATIVE=0` or a failed native build those layers present natively.
+* The source and generated images keep the layer's precision at 32 bits a pixel, so they cost what
+  8-bit does: 10-bit layers are stored as `RGB10A2Unorm` (exact), the XR formats as `BGR10_XR`
+  (exact), gamma-encoded float (for example `kCGColorSpaceExtendedSRGB`, as Unity 2021 presents
+  on Apple Arcade) as the shared-exponent `RGB9E5Float` (9-bit precision, values above 1.0 kept,
+  negative out-of-gamut values clipped to 0), and linear HDR (scRGB, extended linear Display P3)
+  as `RGBA16Float`, as before. A colour space is linear when Core Graphics linearizes it to itself
+  or its name contains `Linear`; one with no name counts as gamma-encoded. That picks the colour
+  kind the shaders' luma pre-pass reads: encoded values as they are, linear SDR through a 2.2 gamma,
+  linear HDR as scRGB. The log's `Metal presentation` line names the storage and the colour kind.
+* Measured on an M2 with `validate --native --store`, 200 iterations: 1080p 7.50 ms (RGBA8), 7.43
+  (RGB10A2), 7.46 (RGB9E5), 7.48 (BGR10_XR), 7.88 (RGBA16F); 1440p 12.80, 12.79, 12.78, 12.82,
+  13.51. Against a half-float reference of the same `mtlclear` scene, 10-bit layers generate
+  exactly, gamma-encoded float within 0.0005 and at 1.113 where 8-bit storage clipped to 1.0, and
+  XR within one XR step (1/510). On the MoltenVK generator everything deeper than 8 bits runs in
+  half float.
+* sRGB sources are copied as their encoded bytes on the Metal path and the proxy swapchain; the
+  Vulkan fixed present path still converts them to linear 8-bit, which crushes dark tones in
+  generated frames, and passes 10-bit and float sources through 8-bit images. Any other format
+  keeps native presentation and the log names its format and colour space.
 
 Everything else keeps native presentation.
 
@@ -674,7 +690,7 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 36 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
+**Unit tests.** 37 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, simple
 fractions ending on the original, cap behaviour, untrusted runs and probing, a present thread
@@ -685,7 +701,8 @@ error messages, profile identification order including the kill switch, executab
 and the catch-all profile, reload on mtime change), the refresh-interval conversion, the PE resource
 walk, the DLL path fix-up, the feature-chain copy, memory type selection, the memory planner, the
 pipeline signature tables, the 64-pixel minimum frame size, the recursive mutex, half-float
-conversion, the latency probe's percentiles and the OpenGL state restore.
+conversion, the latency probe's percentiles, the layer colour classification (storage and colour
+kind per pixel format and colour space) and the OpenGL state restore.
 
 **`validate`.** Runs the generator on a real driver with synthetic input and reports timings and the
 centre pixel of the last generated frame.

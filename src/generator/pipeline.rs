@@ -20,7 +20,7 @@ pub struct Pipeline {
     pub sig: Signature,
     pub extent: (u32, u32),
     pub flow: f32,
-    pub hdr: bool,
+    pub colour: Colour,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     imgs: Vec<Img>,
@@ -106,14 +106,14 @@ impl Pipeline {
         h: u32,
         flow: f32,
         perf: bool,
-        hdr: bool,
+        colour: Colour,
     ) -> Result<Pipeline, String> {
         let mut p = Pipeline {
             inst,
             sig: Signature::new(perf),
             extent: (w, h),
             flow,
-            hdr,
+            colour,
             set_layout: Default::default(),
             layout: Default::default(),
             imgs: vec![],
@@ -142,7 +142,7 @@ impl Pipeline {
     fn build(&mut self) -> Result<(), String> {
         let inst = self.inst.clone();
         let (d, pd, log) = (&inst.device, inst.physical_device, inst.log);
-        let ((w, h), flow, hdr, perf) = (self.extent, self.flow, self.hdr, self.sig.perf);
+        let ((w, h), flow, hdr, perf) = (self.extent, self.flow, self.colour.float(), self.sig.perf);
         log(&format!(
             "Building pipeline for {w}x{h} at {flow:.2} flow ({})",
             if perf { "performance" } else { "quality" }
@@ -352,8 +352,8 @@ impl Pipeline {
         let block = [
             0u32,
             0,
-            if hdr { 2 } else { 0 },
-            if hdr { 1 } else { 0 },
+            self.colour.block()[0],
+            self.colour.block()[1],
             (1.0 / flow).to_bits(),
             0.5f32.to_bits(),
         ];

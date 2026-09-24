@@ -20,7 +20,7 @@ use objc2_metal::{
 
 use super::generator::{image_info, import_texture, native_off, Backend, Built, Native, Unshared, Wrapper, GPU_TIMEOUT};
 use super::{enabled, now, set_enabled, setup, Setup};
-use crate::generator::signature::Signature;
+use crate::generator::signature::{Colour, Signature};
 use crate::log;
 use crate::pacer::{display_refresh, Estimator, Pacer, Sample};
 use crate::settings::PacingMode;
@@ -462,7 +462,7 @@ impl Context {
                             let built = objc2::rc::autoreleasepool(|_| {
                                 MTLCreateSystemDefaultDevice()
                                     .ok_or_else(|| "no Metal device for the OpenGL context".to_string())
-                                    .and_then(|d| Native::new(&d, s, extent, false))
+                                    .and_then(|d| Native::new(&d, s, extent, Colour::SDR))
                             });
                             let _ = tx.send(built.map(Unshared));
                         })
@@ -526,7 +526,7 @@ impl Context {
                 for _ in 0..=m {
                     v.cmd.push(vkutil::allocate_command_buffer(&b.device, b.pool)?);
                 }
-                v.wrapper = Some(Wrapper::new(b, extent, p.flow_for(extent.1), p.performance_mode, false)?);
+                v.wrapper = Some(Wrapper::new(b, extent, p.flow_for(extent.1), p.performance_mode, Colour::SDR)?);
             }
             Ok::<_, String>(())
         })();

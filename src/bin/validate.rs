@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ash::vk;
+use lsfg_metal::generator::signature::Colour;
 use lsfg_metal::generator::{Context, Instance};
 use lsfg_metal::vkutil::{self, check};
 use lsfg_metal::{log, shaders};
@@ -105,7 +106,7 @@ fn run_native(
     let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
     let queue = device.newCommandQueue().ok_or("no Metal queue")?;
     let t0 = Instant::now();
-    let mut p = Pipeline::new(&device, res, r.fp16, (w, h), r.flow, r.perf, r.hdr, relog)?;
+    let mut p = Pipeline::new(&device, res, r.fp16, (w, h), r.flow, r.perf, if r.hdr { Colour::HDR } else { Colour::SDR }, relog)?;
     let build = t0.elapsed();
     let bpp = if r.hdr { 8 } else { 4 };
     let len = w as usize * h as usize * bpp;
@@ -301,7 +302,7 @@ fn run() -> Result<(), String> {
 
     let t0 = Instant::now();
     let inst = Arc::new(Instance::own(&driver, "", &dll, fp16, false, relog)?);
-    let mut ctx = Context::new(inst.clone(), w, h, flow, perf, hdr)?;
+    let mut ctx = Context::new(inst.clone(), w, h, flow, perf, if hdr { Colour::HDR } else { Colour::SDR })?;
     let build = t0.elapsed();
     if partial {
         // regression: a partial iteration never submits the completion fence; the next dispatch and the drop must still return
@@ -310,7 +311,7 @@ fn run() -> Result<(), String> {
         ctx.dispatch(2, true)?;
         drop(ctx);
         // the same thing on the signalled protocol, where settle waits on the timelines instead
-        let mut ctx = Context::new(inst.clone(), w, h, flow, perf, hdr)?;
+        let mut ctx = Context::new(inst.clone(), w, h, flow, perf, if hdr { Colour::HDR } else { Colour::SDR })?;
         let sync = ctx.handles().2;
         let d = &inst.device;
         // the owned device is 1.2, so the branch this test exists for must be the one taken

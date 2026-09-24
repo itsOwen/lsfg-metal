@@ -44,7 +44,7 @@ impl Wrapper {
             h,
             profile.flow_for(h),
             profile.performance_mode,
-            hdr,
+            if hdr { generator::signature::Colour::HDR } else { generator::signature::Colour::SDR },
         )?;
         let (source, dest, sync) = ctx.handles();
         let fence = vkutil::create_fence(&inst.device)?;

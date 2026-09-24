@@ -24,7 +24,7 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use super::drawable::ProxyDrawable;
 use super::latency;
 use super::{enabled, hooks, set_enabled, setup, vk_format, Setup};
-use crate::generator::signature::Signature;
+use crate::generator::signature::{Colour, Signature};
 use crate::generator::{native, Context, Instance};
 use crate::log;
 use crate::pacer::{display_refresh, Estimator, Pacer, Sample};
@@ -535,9 +535,9 @@ impl Wrapper {
         (w, h): (u32, u32),
         flow: f32,
         perf: bool,
-        hdr: bool,
+        colour: Colour,
     ) -> Result<Wrapper, String> {
-        let ctx = Context::new(b.inst.clone(), w, h, flow, perf, hdr)?;
+        let ctx = Context::new(b.inst.clone(), w, h, flow, perf, colour)?;
         let (source, dest, sync) = ctx.handles();
         Ok(Wrapper {
             ctx,
@@ -772,7 +772,7 @@ impl Native {
         device: &ProtocolObject<dyn MTLDevice>,
         setup: &Setup,
         extent: (u32, u32),
-        hdr: bool,
+        colour: Colour,
     ) -> Result<Native, String> {
         // only tested on apple silicon; intel and amd gpus stay on moltenvk
         if !device.supportsFamily(MTLGPUFamily::Apple7) {
@@ -787,7 +787,7 @@ impl Native {
             extent,
             p.flow_for(extent.1),
             p.performance_mode,
-            hdr,
+            colour,
             log::debug,
         )?;
         static ONCE: Once = Once::new();
@@ -864,6 +864,8 @@ fn unorm_view(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Texture, &'sta
     let unorm = match texture.pixelFormat() {
         MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
         MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
+        MTLPixelFormat::BGR10_XR_sRGB => Some(MTLPixelFormat::BGR10_XR),
+        MTLPixelFormat::BGRA10_XR_sRGB => Some(MTLPixelFormat::BGRA10_XR),
         _ => None,
     };
     match unorm {
@@ -898,7 +900,7 @@ pub(super) type Built = Receiver<Result<Unshared<Native>, String>>;
 
 // a native generator being built for this source size and format
 struct Pending {
-    key: ((u32, u32), MTLPixelFormat),
+    key: ((u32, u32), MTLPixelFormat, Colour),
     rx: Built,
 }
 
@@ -943,6 +945,7 @@ struct Worker {
     format: vk::Format,
     // srgb and unorm share a vulkan format, so a switch between them is only visible here
     pixel_format: MTLPixelFormat,
+    colour: Colour,
     imports: HashMap<usize, Import>,
     sems: Option<(vk::Semaphore, vk::Semaphore, vk::Fence)>,
     frame_pending: bool,
@@ -969,6 +972,7 @@ impl Worker {
             extent: (0, 0),
             format: vk::Format::UNDEFINED,
             pixel_format: MTLPixelFormat::Invalid,
+            colour: Colour::SDR,
             imports: HashMap::new(),
             sems: None,
             frame_pending: false,
@@ -1064,15 +1068,18 @@ impl Worker {
     // (re)build the context when the source texture size or format changes
     fn prepare(&mut self, texture: &ProtocolObject<dyn MTLTexture>) -> Result<(), Fail> {
         let (w, h) = (texture.width() as u32, texture.height() as u32);
-        let format = vk_format(texture.pixelFormat())?;
+        // the xr formats have no vulkan equivalent, so only the native generator takes them
+        let format = vk_format(texture.pixelFormat()).unwrap_or(vk::Format::UNDEFINED);
+        let colour = hooks::colour(texture.pixelFormat(), self.gen.layer.colorspace().as_deref())
+            .ok_or_else(|| Fail::Mismatch(format!("unsupported drawable pixel format {}", texture.pixelFormat().0)))?;
         if (self.ctx.is_some() || self.native.is_some())
             && (w, h) == self.extent
             && texture.pixelFormat() == self.pixel_format
+            && colour == self.colour
         {
             return Ok(());
         }
-        let key = ((w, h), texture.pixelFormat());
-        let hdr = format == vk::Format::R16G16B16A16_SFLOAT;
+        let key = ((w, h), texture.pixelFormat(), colour);
         if !self.native_off {
             // the native build runs off the worker, so the game never waits on it; its frames show as they are meanwhile
             match self.pending.as_ref().filter(|p| p.key == key).map(|p| p.rx.try_recv()) {
@@ -1080,9 +1087,9 @@ impl Worker {
                 Some(Ok(Ok(n))) => {
                     self.pending = None;
                     self.reset();
-                    self.announce(texture);
+                    self.announce(texture, colour);
                     self.native = Some(n.0);
-                    (self.extent, self.format, self.pixel_format) = ((w, h), format, texture.pixelFormat());
+                    (self.extent, self.format, self.pixel_format, self.colour) = ((w, h), format, texture.pixelFormat(), colour);
                     return Ok(());
                 }
                 Some(result) => {
@@ -1106,7 +1113,7 @@ impl Worker {
                         .name("lsfg-metal native build".into())
                         .spawn(move || {
                             let device = device.get();
-                            let built = autoreleasepool(|_| Native::new(&device, setup, (w, h), hdr));
+                            let built = autoreleasepool(|_| Native::new(&device, setup, (w, h), colour));
                             let _ = tx.send(built.map(Unshared));
                         })
                         .map_err(|e| format!("no thread for the native build: {e}"))?;
@@ -1120,10 +1127,18 @@ impl Worker {
         if !Signature::new(p.performance_mode).fits(w, h, p.flow_for(h)) {
             return Err(Fail::Mismatch(format!("{w}x{h} is too small to generate frames for")));
         }
-        self.announce(texture);
+        // only this layer goes without generation, so it is not an error that would stop every other layer
+        if format == vk::Format::UNDEFINED {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn("XR layer without the native generator; its frames show as they are");
+            }
+            return Err(Fail::Mismatch("XR layer without the native generator".into()));
+        }
+        self.announce(texture, colour);
         self.backend()?;
         let b = self.backend.as_ref().ok_or("backend missing")?;
-        self.ctx = Some(Wrapper::new(b, (w, h), p.flow_for(h), p.performance_mode, hdr)?);
+        self.ctx = Some(Wrapper::new(b, (w, h), p.flow_for(h), p.performance_mode, colour)?);
         if self.sems.is_none() {
             let game = import_event(&b.device, &self.gen.game_event)?;
             let present = import_event(&b.device, &self.gen.present_event)?;
@@ -1133,12 +1148,12 @@ impl Worker {
             self.cmd
                 .push(vkutil::allocate_command_buffer(&b.device, b.pool)?);
         }
-        (self.extent, self.format, self.pixel_format) = ((w, h), format, texture.pixelFormat());
+        (self.extent, self.format, self.pixel_format, self.colour) = ((w, h), format, texture.pixelFormat(), colour);
         Ok(())
     }
 
     // the display rate and pacer for a new context, and its log line
-    fn announce(&mut self, texture: &ProtocolObject<dyn MTLTexture>) {
+    fn announce(&mut self, texture: &ProtocolObject<dyn MTLTexture>, colour: Colour) {
         let (w, h) = (texture.width() as u32, texture.height() as u32);
         let p = &self.setup.profile;
         // the window may have moved to another display, or the mode changed, since the last build
@@ -1151,12 +1166,17 @@ impl Worker {
             format!("multiplier {m}")
         };
         log::info(&format!(
-            "Metal presentation {w}x{h} ({:?}{}), {mode}, display {} Hz, flow {:.2}",
-            vk_format(texture.pixelFormat()).unwrap_or(vk::Format::UNDEFINED),
+            "Metal presentation {w}x{h} (pixel format {}{}, stored {:?}, colour kind {}), {mode}, display {} Hz, flow {:.2}",
+            texture.pixelFormat().0,
             match texture.pixelFormat() {
-                MTLPixelFormat::BGRA8Unorm_sRGB | MTLPixelFormat::RGBA8Unorm_sRGB => " srgb",
+                MTLPixelFormat::BGRA8Unorm_sRGB
+                | MTLPixelFormat::RGBA8Unorm_sRGB
+                | MTLPixelFormat::BGR10_XR_sRGB
+                | MTLPixelFormat::BGRA10_XR_sRGB => " srgb",
                 _ => "",
             },
+            colour.store,
+            colour.kind,
             (1.0 / self.refresh).round(),
             p.flow_for(h)
         ));
@@ -1170,7 +1190,7 @@ impl Worker {
             return Ok(v.clone());
         }
         if (texture.width() as u32, texture.height() as u32) != self.extent
-            || vk_format(texture.pixelFormat()).ok() != Some(self.format)
+            || (texture.pixelFormat() != self.pixel_format && vk_format(texture.pixelFormat()).ok() != Some(self.format))
         {
             return Err(Fail::Mismatch(
                 "drawable does not match the layer it came from".into(),
