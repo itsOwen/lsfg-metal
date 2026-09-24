@@ -818,7 +818,9 @@ drawable and blits a 32x32 white square that moves 8 px per frame, which is what
 visible. `MTLTEST_FPS` paces the source rate; `MTLTEST_MINDURATION=<fps>` presents with
 `afterMinimumDuration: 1/fps` (a value of 1 or less means 1/60); `MTLTEST_WIDTH` and
 `MTLTEST_HEIGHT` size the window, 640x480 by default. `MTLTEST_FORMAT` takes a raw
-`MTLPixelFormat` value for the layer (the square is only drawn for BGRA8), and `MTLTEST_DOUBLE`
+`MTLPixelFormat` value for the layer (the square is only drawn for BGRA8), `MTLTEST_COLORSPACE`
+a Core Graphics colour space name (for example `kCGColorSpaceExtendedSRGB`), `MTLTEST_SCALE`
+multiplies the clear colour (above 1 or below 0 for the extended formats), and `MTLTEST_DOUBLE`
 presents a second layer on the same command buffer. It needs the shim injected:
 
 ```sh

@@ -3,6 +3,8 @@
 // MTLTEST_WIDTH and MTLTEST_HEIGHT size the window, default 640x480
 // MTLTEST_FORMAT=<raw MTLPixelFormat> sets the layer format; MTLTEST_DOUBLE presents a second layer on the same command buffer
 // MTLTEST_DIRECT presents on the drawable after the commit instead of through the command buffer, ignoring MTLTEST_MINDURATION
+// MTLTEST_COLORSPACE=<core graphics name, e.g. kCGColorSpaceExtendedSRGB> sets the layer's colour space
+// MTLTEST_SCALE multiplies the clear colour, above 1 or below 0 for the extended formats
 // run with the shim on DYLD_INSERT_LIBRARIES and LSFGM_METAL=1; the example must not link the crate itself
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -13,7 +15,8 @@ use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSWindow, NSWindowStyleMask,
 };
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFString, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::CGColorSpace;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -68,6 +71,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .map_or(MTLPixelFormat::BGRA8Unorm, MTLPixelFormat);
     layer.setPixelFormat(format);
+    if let Ok(name) = std::env::var("MTLTEST_COLORSPACE") {
+        let space = CGColorSpace::with_name(Some(&CFString::from_str(&name))).expect("unknown colour space name");
+        layer.setColorspace(Some(&space));
+    }
     layer.setDrawableSize(CGSize::new(w, h));
     layer.setFramebufferOnly(false);
     let view = window.contentView().expect("content view");
@@ -109,6 +116,7 @@ fn render(
     direct: bool,
 ) {
     let queue = device.newCommandQueue().expect("queue");
+    let scale = std::env::var("MTLTEST_SCALE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
     let square = {
         let d = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
@@ -168,10 +176,11 @@ fn render(
             att.setLoadAction(MTLLoadAction::Clear);
             att.setStoreAction(MTLStoreAction::Store);
             let c = (i % 60) as f64 / 60.0;
+            let k = scale;
             att.setClearColor(MTLClearColor {
-                red: 0.1,
-                green: 0.2 + 0.5 * c,
-                blue: 0.4,
+                red: 0.1 * k,
+                green: (0.2 + 0.5 * c) * k,
+                blue: 0.4 * k,
                 alpha: 1.0,
             });
             cb.renderCommandEncoderWithDescriptor(&pass)
