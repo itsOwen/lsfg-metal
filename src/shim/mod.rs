@@ -1394,10 +1394,14 @@ unsafe extern "system" fn create_swapchain(
                 }
             }
         },
-        None => match native() {
-            Ok(sc) => (sc, None, false),
-            Err(r) => return r,
-        },
+        // nothing has named the old swapchain yet, so this create retires it
+        None => {
+            let mut sc = vk::SwapchainKHR::null();
+            match real(device, ci, alloc, &mut sc) {
+                vk::Result::SUCCESS => (sc, None, false),
+                r => return r,
+            }
+        }
     };
     let Some(destroy) =
         dfetch::<vk::PFN_vkDestroySwapchainKHR>(dev.gdpa, device, c"vkDestroySwapchainKHR")
