@@ -326,7 +326,7 @@ library builds one profile named `(environment)` from the variables below and us
 | `LSFGM_PROFILE` | select a profile by exact name | profile name | unset |
 | `LSFGM_DISABLE` | turn the shim off for this process: no profile, no swizzles, every path passes through | read by **presence**, any value including empty | unset |
 | `DISABLE_LSFGM` | the same kill switch under the name Highball already writes when frame generation is off | read by **presence**, any value including empty | unset |
-| `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.8.0-beta.1` |
+| `LSFGM_VERSION` | **build-time** override of the compiled-in version string | any string | a git-derived string, else `0.8.0` |
 
 Read by presence alone (an empty value still counts): `LSFGM_ENV`, `LSFGM_DISABLE`,
 `DISABLE_LSFGM`, `LSFGM_STATS`, `LSFGM_PACE_DEBUG`, `LSFGM_LATENCY` and `LSFGM_GPU_PROFILE`. Every
@@ -640,9 +640,9 @@ Version string. Two independent steps derive one, and they use different rules.
   `LSFGM_VERSION` when that is set and non-empty. Otherwise it asks git for the short HEAD sha and
   the nearest tag: exactly on a tag the version is the tag, otherwise `<tag>.r<commits>.g<sha>`,
   with `unknown` in place of the tag when the repository has none, and `-dirty` appended when
-  tracked files are modified. With no git at all it falls back to `0.8.0-beta.1`.
+  tracked files are modified. With no git at all it falls back to `0.8.0`.
 * `Scripts/package.sh` writes the version in `source.txt`. It takes `LSFGM_VERSION` when set,
-  otherwise `git describe --tags --always --dirty`, otherwise `0.8.0-beta.1`.
+  otherwise `git describe --tags --always --dirty`, otherwise `0.8.0`.
 
 The script does not build, so the compiled-in version and `source.txt` agree only when
 `LSFGM_VERSION` is exported for both the `cargo build` and the packaging step. Left to their own

@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")/.."
 out=dist/renderers/lsfg
-version="${LSFGM_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.8.0-beta.1)}"
+version="${LSFGM_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.8.0)}"
 # the arm64 build packages the same way; the caller picks which one is already built
 target="${LSFGM_TARGET:-x86_64-apple-darwin}"
 rm -rf "$out"
