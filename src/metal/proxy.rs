@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_core_graphics::{kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceSRGB, CGColorSpace};
+use objc2_core_graphics::{
+    kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB, CGColorSpace,
+};
 use objc2_metal::{MTLPixelFormat, MTLTexture};
 use objc2_quartz_core::CAMetalLayer;
 
@@ -15,6 +17,7 @@ use super::generator::{image_info, import_event, import_texture, submit, Generat
 use super::{hooks, now, set_enabled};
 use crate::log;
 use crate::pacer::Estimator;
+use crate::settings::ScalerMode;
 
 // the game's device as adopted by the shim
 #[derive(Clone)]
@@ -86,6 +89,10 @@ impl ProxySwapchain {
         let Some(layer) = hooks::layer_of_surface(surface) else {
             return Ok(None);
         };
+        // a create that ends on the fixed path must not leave an earlier swapchain's upscaling behind
+        if let Some(g) = Generator::existing(&layer) {
+            g.clear_upscaling();
+        }
         let mut p = info.p_next as *const vk::BaseInStructure;
         while !p.is_null() {
             unsafe {
@@ -105,14 +112,37 @@ impl ProxySwapchain {
         let Some(format) = super::mtl_format(info.image_format) else {
             return Ok(None);
         };
+        let setup = super::setup().ok_or("no active frame-generation profile")?;
         // the generator treats float as scrgb and everything else as srgb; other pairs keep the driver swapchain
         let scrgb = info.image_color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT;
-        if scrgb != (format == MTLPixelFormat::RGBA16Float)
-            || !(scrgb || info.image_color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
-        {
+        let plain = scrgb == (format == MTLPixelFormat::RGBA16Float)
+            && (scrgb || info.image_color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR);
+        // only upscaling takes hdr10 and gamma-encoded float here, as the metal front end does, for now
+        let pq = info.image_color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT
+            && matches!(format, MTLPixelFormat::RGB10A2Unorm | MTLPixelFormat::BGR10A2Unorm);
+        let float_srgb = format == MTLPixelFormat::RGBA16Float
+            && info.image_color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        if !plain && !((pq || float_srgb) && setup.profile.scaler != ScalerMode::Off) {
             return Ok(None);
         }
-        let setup = super::setup().ok_or("no active frame-generation profile")?;
+        let gen = Generator::get(&layer).ok_or("no Metal device for the layer")?;
+        let extent = (info.image_extent.width, info.image_extent.height);
+        let up = gen.upscale_to(extent, format, if scrgb { 2 } else { 0 });
+        // hdr10 and gamma float are here only to upscale
+        if up.is_none() && !plain {
+            return Ok(None);
+        }
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        if up.is_none() && setup.profile.scaler != ScalerMode::Off {
+            NOTE.call_once(|| log::info(&format!(
+                "MetalFX upscaling not used: the window is not larger than {}x{} in pixels, or MetalFX cannot run here",
+                extent.0, extent.1
+            )));
+        }
+        // multiplier 1 is here only to upscale
+        if setup.profile.multiplier < 2 && up.is_none() {
+            return Ok(None);
+        }
         hooks::install();
         hooks::install_cb_hooks(&layer);
         set_enabled(true);
@@ -121,26 +151,33 @@ impl ProxySwapchain {
             vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
         );
         layer.setDisplaySyncEnabled(setup.profile.override_present_mode || vsync);
-        let gen = Generator::get(&layer).ok_or("no Metal device for the layer")?;
         let count = info.min_image_count.max(3) as usize;
-        let extent = (info.image_extent.width, info.image_extent.height);
         // no driver swapchain configures the layer for us: device, format, blit target, size
         if layer.device().is_none() {
             layer.setDevice(Some(&gen.device));
         }
         layer.setPixelFormat(format);
-        // no driver swapchain sets the colour space either; scrgb values above 1.0 also need edr
+        // no driver swapchain sets the colour space either; scrgb values above 1.0 and pq also need edr
         let space = unsafe {
             CGColorSpace::with_name(Some(if scrgb {
                 kCGColorSpaceExtendedLinearSRGB
+            } else if pq {
+                kCGColorSpaceITUR_2100_PQ
             } else {
                 kCGColorSpaceSRGB
             }))
         };
         layer.setColorspace(space.as_deref());
-        layer.setWantsExtendedDynamicRangeContent(scrgb);
+        layer.setWantsExtendedDynamicRangeContent(scrgb || pq);
         layer.setFramebufferOnly(false);
-        layer.setDrawableSize(objc2_core_foundation::CGSize::new(extent.0 as f64, extent.1 as f64));
+        // while upscaling the real drawables are the shown size and the game's images stay at its own
+        gen.set_upscaling(up.map(|shown| (extent, shown)), extent);
+        if let Some(shown) = up {
+            log::info(&format!(
+                "MetalFX upscaling {}x{} to {}x{}",
+                extent.0, extent.1, shown.0, shown.1
+            ));
+        }
         let mut textures = Vec::with_capacity(count);
         let mut images = Vec::with_capacity(count);
         let flags = if info
@@ -184,6 +221,7 @@ impl ProxySwapchain {
         let ready = match built {
             Ok(r) => r,
             Err(e) => {
+                gen.clear_upscaling();
                 for i in images {
                     unsafe {
                         game.device.destroy_image(i, None);
@@ -391,6 +429,8 @@ impl ProxySwapchain {
     fn invalidate_locked(&self, queue: vk::Queue, info: Option<&vk::PresentInfoKHR>) {
         self.state.0.lock().unwrap().invalid = true;
         set_proxy_supported(false);
+        // later creates take the fixed path without reaching the clear in create
+        self.gen.clear_upscaling();
         let waits: Vec<_> = info
             .map(wait_semaphores)
             .unwrap_or(&[])

@@ -67,6 +67,29 @@ impl PacingMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalerMode {
+    Off,
+    MetalFx,
+}
+
+impl ScalerMode {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        Ok(match s.to_lowercase().as_str() {
+            "off" | "none" => Self::Off,
+            "metalfx" => Self::MetalFx,
+            other => return Err(format!("Unrecognized scaler: {other}")),
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::MetalFx => "metalfx",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub name: String,
@@ -78,6 +101,7 @@ pub struct Profile {
     pub performance_mode: bool,
     pub override_present_mode: bool,
     pub preserve_swapchain_image_count: bool,
+    pub scaler: ScalerMode,
 }
 
 impl Profile {
@@ -93,6 +117,11 @@ impl Profile {
     fn flow_valid(&self) -> bool {
         self.flow_auto || (0.25..=1.0).contains(&self.flow_scale)
     }
+
+    // multiplier 1 only upscales, so it needs a scaler
+    pub fn active(&self) -> bool {
+        self.multiplier > 1 || self.scaler != ScalerMode::Off
+    }
 }
 
 impl Default for Profile {
@@ -107,6 +136,7 @@ impl Default for Profile {
             performance_mode: false,
             override_present_mode: true,
             preserve_swapchain_image_count: false,
+            scaler: ScalerMode::Off,
         }
     }
 }
@@ -221,11 +251,14 @@ fn env_profile(env: Env) -> Result<Profile, String> {
     if let Some(v) = nonempty(env, "LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT") {
         p.preserve_swapchain_image_count = v == "1";
     }
-    if p.multiplier > 4 {
-        return Err("The macOS shim supports multipliers from 2 to 4".into());
+    if let Some(v) = nonempty(env, "LSFGM_SCALER") {
+        p.scaler = ScalerMode::parse(&v)?;
     }
-    if p.multiplier <= 1 {
-        return Err("LSFGM_MULTIPLIER must be greater than 1".into());
+    if p.multiplier > 4 {
+        return Err("The macOS shim supports multipliers up to 4".into());
+    }
+    if !p.active() {
+        return Err("LSFGM_MULTIPLIER must be greater than 1, or 1 with LSFGM_SCALER".into());
     }
     if !p.flow_valid() {
         return Err("LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto".into());
@@ -481,6 +514,7 @@ pub fn parse(text: &str, env: Env) -> Result<Config, String> {
                     "preserve_swapchain_image_count" => {
                         p.preserve_swapchain_image_count = as_bool(val, key)?
                     }
+                    "scaler" => p.scaler = ScalerMode::parse(&as_str(val, key)?)?,
                     _ => return Err(format!("Unknown key in profile section: {key}")),
                 }
             }
@@ -561,6 +595,10 @@ pub fn to_toml(cfg: &Config) -> String {
             p.override_present_mode,
             p.preserve_swapchain_image_count
         );
+        // only when set, so a file this writes still loads in versions without upscaling
+        if p.scaler != ScalerMode::Off {
+            let _ = writeln!(out, "scaler = {}", q(p.scaler.name()));
+        }
     }
     out
 }
@@ -768,6 +806,7 @@ mod tests {
             ("LSFGM_PACING_MODE", "ADAPTIVE"),
             ("LSFGM_OVERRIDE_PRESENT_MODE", "0"),
             ("LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT", "1"),
+            ("LSFGM_SCALER", "MetalFX"),
             ("LSFGM_DLL_PATH", "/d.dll"),
             ("LSFGM_NO_FP16", "1"),
             ("LSFGM_LOG_LEVEL", "Warning"),
@@ -785,7 +824,24 @@ mod tests {
             (3, 0.5, PacingMode::Adaptive)
         );
         assert!(p.performance_mode && !p.override_present_mode && p.preserve_swapchain_image_count);
+        assert_eq!(p.scaler, ScalerMode::MetalFx);
         assert_eq!(identify_with(&cfg, &e), Some((0, Method::Environment)));
+    }
+
+    #[test]
+    fn multiplier_one_only_with_a_scaler() {
+        let e = env(&[("LSFGM_ENV", ""), ("LSFGM_MULTIPLIER", "1"), ("LSFGM_SCALER", "metalfx")]);
+        let p = &load_with(&e).unwrap().profiles[0];
+        assert!(p.multiplier == 1 && p.active());
+        let t = "version = 2\n[global]\n[[profile]]\nname = \"p\"\nmultiplier = 1\nscaler = \"metalfx\"\n";
+        let cfg = parse(t, &env(&[])).unwrap();
+        assert_eq!(cfg.profiles[0].scaler, ScalerMode::MetalFx);
+        assert_eq!(Profile::default().scaler, ScalerMode::Off);
+        assert!(!Profile { multiplier: 1, ..Default::default() }.active());
+        // written only when on, so older versions still load the file; and it reads back
+        assert!(!to_toml(&parse("version = 2\n[global]\n[[profile]]\nname = \"p\"\n", &env(&[])).unwrap()).contains("scaler"));
+        let back = parse(&to_toml(&cfg), &env(&[])).unwrap();
+        assert_eq!(back.profiles[0].scaler, ScalerMode::MetalFx);
     }
 
     #[test]
@@ -862,15 +918,16 @@ mod tests {
         }
         assert_eq!(
             err(&[("LSFGM_MULTIPLIER", "5")]),
-            "The macOS shim supports multipliers from 2 to 4"
+            "The macOS shim supports multipliers up to 4"
         );
         assert_eq!(
             err(&[("LSFGM_MULTIPLIER", "1")]),
-            "LSFGM_MULTIPLIER must be greater than 1"
+            "LSFGM_MULTIPLIER must be greater than 1, or 1 with LSFGM_SCALER"
         );
+        assert_eq!(err(&[("LSFGM_SCALER", "fsr")]), "Unrecognized scaler: fsr");
         assert_eq!(
             err(&[("LSFGM_MULTIPLIER", "0")]),
-            "LSFGM_MULTIPLIER must be greater than 1"
+            "LSFGM_MULTIPLIER must be greater than 1, or 1 with LSFGM_SCALER"
         );
         assert_eq!(
             err(&[("LSFGM_FLOW_SCALE", "0.2")]),

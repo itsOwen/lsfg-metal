@@ -38,8 +38,10 @@ Three hooks cover the renderers a Wine bottle can use:
   buffer, and Metal 4, where the queue waits on and signals the drawable and the drawable is
   presented directly. D3DMetal 4 (Game Porting Toolkit 4) uses Metal 4 by default on macOS 27,
   tested with Codename CURE II and Absolute Drift under CrossOver 26.3.
-* Multipliers 2 to 4. Multiplier 1 is accepted in a config file and disables generation; above 4 is
-  rejected by the settings library.
+* Multipliers 2 to 4. Multiplier 1 only upscales when a scaler is set, and otherwise disables
+  generation; above 4 is rejected by the settings library.
+* MetalFX upscaling, off unless asked for: the game's frame is scaled up to the window's size in
+  physical pixels, with frame generation or on its own at multiplier 1. See [Upscaling](#upscaling).
 * Pacing: fixed (`vsync`, evenly spaced timestamps `1/m .. m/m`) and adaptive (the pacer fits
   generated frames to display slots).
 * Performance mode (the performance shader set) and flow scale 0.25 to 1.0, or `auto`.
@@ -147,6 +149,37 @@ frames on every path, because the coarsest level of the flow pyramid would be em
 
 With no matching profile, all hooks stay out of the way: the shim forwards every call to the real
 driver and the `nextDrawable` hook returns the original drawable. It is a transparent passthrough.
+
+## Upscaling
+
+`scaler = "metalfx"` in a profile, or `LSFGM_SCALER=metalfx` in environment mode, scales each frame
+up with Apple's MetalFX spatial scaler before it is shown. It is off by default (`off` and `none`
+also turn it off). Wine with Retina mode off presents at half the window's physical pixels, so a
+Wine game's frames are scaled up to the window's size in physical pixels, which is the window's
+bounds times the main screen's scale. It combines with frame generation, or works alone at
+multiplier 1.
+
+* The Metal front end, the Vulkan proxy swapchain and the OpenGL front end upscale; the OpenGL front
+  end only views without a Retina surface. The Vulkan fixed present path does not upscale, and says
+  so once:
+  `MetalFX upscaling not used: this swapchain presents through the fixed path, and only the proxy upscales`.
+* A game that already presents at the window's full size is left alone, with one log line:
+  `MetalFX upscaling not used: the game presents at <w>x<h>, not smaller than the window's <w>x<h> pixels`
+  (the proxy swapchain adds `MetalFX upscaling not used: the window is not larger than ...`, and the
+  OpenGL front end logs `MetalFX upscaling not used for OpenGL: ...`). Native Valheim and Cemu are
+  such games.
+* Upscaling logs `MetalFX upscaling <w>x<h> to <w>x<h>`. MetalFX needs macOS 13 and a GPU it
+  supports; elsewhere, or if the scaler cannot be made for a size or format, frames show at the
+  game's size and the log says why. Linear and HDR layers are scaled in MetalFX's linear and HDR
+  modes.
+* Measured on an M2: one upscale from 1470x920 to 2940x1840 costs about 2 ms of GPU time. On the
+  OpenGL front end, Slay the Spire under Wine at 2x went from about 30 to about 26 source fps with
+  it on.
+* Tested at 2x and alone, on macOS 27: DXVK, DXMT and D3DMetal in Highball (1470x956 to 2940x1912),
+  D3DMetal 4 in CrossOver 26.3 (1470x834 to 2940x1668), Slay the Spire on OpenGL natively (1280x720
+  to 2560x1440) and under Wine (1470x936 to 2940x1872), and Heaven 4.0 on WineD3D's OpenGL renderer.
+* Highball turns the shim off at multiplier 1, so upscaling alone does not work through Highball
+  yet; upscaling with frame generation does.
 
 ## Requirements
 
@@ -259,7 +292,7 @@ WineD3D only start on CrossOver's own MoltenVK, and `LSFGM_MOLTENVK` would chang
 game uses as well.
 
 The Vulkan fixed present path always generates on the game's own driver, which here is CrossOver's
-MoltenVK 1.2.10, so a Vulkan swapchain that lands on it (HDR10 or float sRGB,
+MoltenVK 1.2.10, so a Vulkan swapchain that lands on it (HDR10 or float sRGB without upscaling,
 `LSFGM_VULKAN_PROXY=0`, or a proxy swapchain that could not be created) logs
 `Frame generation disabled; using passthrough` and presents without generated frames. A newer
 MoltenVK from step 2 does not change that.
@@ -302,7 +335,8 @@ library builds one profile named `(environment)` from the variables below and us
 | Variable | Meaning | Values | Default |
 |---|---|---|---|
 | `LSFGM_ENV` | selects environment-profile mode | read by **presence**, any value including empty | unset (file mode) |
-| `LSFGM_MULTIPLIER` | frames shown per source frame | unsigned decimal, whole string, at most 2^32-1; 2 to 4 | 2 |
+| `LSFGM_MULTIPLIER` | frames shown per source frame | unsigned decimal, whole string, at most 2^32-1; 2 to 4, or 1 with `LSFGM_SCALER` | 2 |
+| `LSFGM_SCALER` | upscale each frame to the window's size in physical pixels, see [Upscaling](#upscaling) | `metalfx`, or `off` / `none`; matched case-insensitively | off |
 | `LSFGM_FLOW_SCALE` | flow resolution scale | float, 0.25 to 1.0, or `auto` (see below) | 1.0 |
 | `LSFGM_PERFORMANCE_MODE` | use the performance shader set | `1` is true, any other non-empty value is false | false |
 | `LSFGM_PACING_MODE` | pacing | `vsync` or `none` (fixed), `adaptive`; matched case-insensitively | `vsync` |
@@ -356,8 +390,10 @@ There is no `LSFGM_HDR`. HDR is decided by the swapchain or layer format and col
 variable.
 
 Validation errors in environment mode: `Invalid LSFGM_MULTIPLIER`,
-`The macOS shim supports multipliers from 2 to 4`, `LSFGM_MULTIPLIER must be greater than 1`,
-`LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto`, `Unrecognized pacing mode: <value>`.
+`The macOS shim supports multipliers up to 4`,
+`LSFGM_MULTIPLIER must be greater than 1, or 1 with LSFGM_SCALER`,
+`LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto`, `Unrecognized pacing mode: <value>`,
+`Unrecognized scaler: <value>`.
 
 When `LSFGM_DLL_PATH` is unset the shader package is looked for in Steam under `HOME`, then in
 Steam inside the Wine prefix named by `WINEPREFIX`, then in the working directory. A launcher
@@ -423,7 +459,10 @@ Supported subset of TOML:
   `Unknown key in [global] section: <key>`, `Unknown key in profile section: <key>`).
 * A profile's `multiplier` must be 1 to 4 (above 4 is `Profile '<name>' has multiplier > 4`, below 1
   is `Profile '<name>' has multiplier < 1`) and its `flow_scale` 0.25 to 1.0 or `"auto"`. Multiplier
-  1 is accepted here and disables generation; environment mode is stricter and requires 2 to 4.
+  1 only upscales when the profile sets a scaler, and otherwise disables generation; environment
+  mode takes 1 only with `LSFGM_SCALER`.
+* A profile's `scaler` is `"metalfx"`, `"off"` or `"none"`; it is written to the file only when on,
+  so older versions still read it. See [Upscaling](#upscaling).
 
 Reload on change: on the Vulkan fixed present path the shim stats the config file at every present
 and records its modification time and size. When either changes it reparses, logs
@@ -699,20 +738,20 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 38 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
-`LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
-that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, simple
-fractions ending on the original, cap behaviour, untrusted runs and probing, a present thread
+**Unit tests.** 40 tests, `cargo test --release`; only the OpenGL and MetalFX ones need a GPU
+session. Set `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file;
+without it that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios,
+simple fractions ending on the original, cap behaviour, untrusted runs and probing, a present thread
 blocked for the whole interval, invalid intervals, the hitch floor on a fast display, a closed-loop
 convergence model), the settings library (environment mode, `auto` flow scale and a repeated
-`flow_scale` key, config path precedence, a missing config file and a dangling symlink, TOML round
-trip and `~` expansion, error messages, profile identification order including the kill switch,
-executable-name matching and the catch-all profile, reload on change), the refresh-interval
-conversion, the PE resource walk, the DLL path fix-up, the feature-chain copy, memory type
-selection, the memory planner, the pipeline signature tables, the 64-pixel minimum frame size, the
-recursive mutex, half-float conversion, the latency probe's percentiles, the layer colour
-classification (storage and colour kind per pixel format and colour space) and the OpenGL state
-restore.
+`flow_scale` key, multiplier 1 only with a scaler, config path precedence, a missing config file
+and a dangling symlink, TOML round trip and `~` expansion, error messages, profile identification
+order including the kill switch, executable-name matching and the catch-all profile, reload on
+change), the MetalFX scaler building or declining cleanly, the refresh-interval conversion, the PE
+resource walk, the DLL path fix-up, the feature-chain copy, memory type selection, the memory
+planner, the pipeline signature tables, the 64-pixel minimum frame size, the recursive mutex,
+half-float conversion, the latency probe's percentiles, the layer colour classification (storage
+and colour kind per pixel format and colour space) and the OpenGL state restore.
 
 **`validate`.** Runs the generator on a real driver with synthetic input and reports timings and the
 centre pixel of the last generated frame.
@@ -863,6 +902,9 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
 
 ## Limitations
 
+* Upscaling alone (multiplier 1) does not work through Highball yet, which turns the shim off at
+  multiplier 1. The Vulkan fixed present path does not upscale. A game on a secondary display is
+  upscaled to the main screen's scale.
 * Native macOS games are tested on two titles, the native Valheim (on both generators) and Cemu (on
   the MoltenVK generator only), and work only when their code signature allows injected libraries.
 * The native generator runs only on Apple silicon GPUs; Intel and AMD GPUs generate on MoltenVK.
@@ -870,7 +912,8 @@ Run the native examples with the `DYLD_*` variables set directly. Never wrap the
   tested at all.
 * HDR10 has not been tested on an HDR display. The proxy swapchain only presents sRGB and scRGB, so
   HDR10 and float sRGB swapchains use the fixed present path: fixed pacing, generated on the game's
-  device, which needs the game's MoltenVK to be 1.3 or newer.
+  device, which needs the game's MoltenVK to be 1.3 or newer. With upscaling on and a window larger
+  than the game, the proxy takes them instead.
 * Multi-GPU Intel Macs are handled by name only. On the native generator the Metal front end uses
   the layer's own `MTLDevice` and the OpenGL front end uses `MTLCreateSystemDefaultDevice`, but a
   multi-GPU Mac has no Apple silicon GPU, so it generates on MoltenVK. There the Metal front end's

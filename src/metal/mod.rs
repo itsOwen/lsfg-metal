@@ -4,6 +4,7 @@ mod generator;
 mod gl;
 mod hooks;
 mod latency;
+mod metalfx;
 mod proxy;
 
 use std::path::PathBuf;

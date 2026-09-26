@@ -2,6 +2,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 
 use ash::vk::{self, Handle};
@@ -9,6 +10,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Imp, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{define_class, ffi, msg_send, sel, AnyThread, ClassType, DefinedClass, Message};
 use objc2_foundation::NSObject;
+use objc2_core_foundation::CGSize;
 use objc2_core_graphics::CGColorSpace;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent,
@@ -21,11 +23,14 @@ use super::generator::{Generator, Job};
 use super::{enabled, now, set_enabled};
 use crate::generator::signature::{Colour, Store};
 use crate::log;
+use crate::settings::ScalerMode;
 
 type NextDrawableFn = unsafe extern "C-unwind" fn(*mut CAMetalLayer, Sel) -> *mut AnyObject;
 type PresentFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject);
 type PresentTimedFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject, f64);
 type CommitFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
+type GetSizeFn = unsafe extern "C-unwind" fn(*mut CAMetalLayer, Sel) -> CGSize;
+type SetSizeFn = unsafe extern "C-unwind" fn(*mut CAMetalLayer, Sel, CGSize);
 
 struct CbHooks {
     present: PresentFn,
@@ -35,6 +40,12 @@ struct CbHooks {
 }
 
 static NEXT_DRAWABLE: OnceLock<NextDrawableFn> = OnceLock::new();
+static GET_SIZE: OnceLock<GetSizeFn> = OnceLock::new();
+static SET_SIZE: OnceLock<SetSizeFn> = OnceLock::new();
+// set once any layer upscales; until then the size getter only forwards
+static UPSCALED: AtomicBool = AtomicBool::new(false);
+// a scaler is configured; until then the size setter only forwards
+static SCALING: AtomicBool = AtomicBool::new(false);
 static CB_HOOKS: OnceLock<CbHooks> = OnceLock::new();
 static INSTALL: Mutex<()> = Mutex::new(());
 static INIT: Once = Once::new();
@@ -81,6 +92,60 @@ pub fn install() {
             next_drawable_hook as *const (),
         ))
     };
+    // an upscaled layer keeps the game's size for the game while its real drawables are the shown size
+    let cls = CAMetalLayer::class();
+    if let (Some(get), Some(set)) = (
+        cls.instance_method(sel!(drawableSize)),
+        cls.instance_method(sel!(setDrawableSize:)),
+    ) {
+        unsafe {
+            let _ = GET_SIZE.set(std::mem::transmute::<Imp, GetSizeFn>(get.implementation()));
+            let _ = SET_SIZE.set(std::mem::transmute::<Imp, SetSizeFn>(set.implementation()));
+            get.set_implementation(std::mem::transmute::<*const (), Imp>(get_size_hook as *const ()));
+            set.set_implementation(std::mem::transmute::<*const (), Imp>(set_size_hook as *const ()));
+        }
+    }
+}
+
+pub(crate) fn mark_upscaled() {
+    UPSCALED.store(true, Ordering::Relaxed);
+}
+
+// the layer's real drawable size, past the swizzle
+pub(crate) fn real_drawable_size(layer: &CAMetalLayer) -> (u32, u32) {
+    let s = match GET_SIZE.get() {
+        Some(f) => unsafe { f(layer as *const _ as *mut _, sel!(drawableSize)) },
+        None => layer.drawableSize(),
+    };
+    (s.width.round() as u32, s.height.round() as u32)
+}
+
+pub(crate) fn set_real_drawable_size(layer: &CAMetalLayer, (w, h): (u32, u32)) {
+    let size = CGSize::new(w as f64, h as f64);
+    match SET_SIZE.get() {
+        Some(f) => unsafe { f(layer as *const _ as *mut _, sel!(setDrawableSize:), size) },
+        None => layer.setDrawableSize(size),
+    }
+}
+
+unsafe extern "C-unwind" fn get_size_hook(this: *mut CAMetalLayer, sel: Sel) -> CGSize {
+    if UPSCALED.load(Ordering::Relaxed) {
+        if let Some(((w, h), _)) = Generator::existing(&*this).and_then(|g| g.upscaling()) {
+            return CGSize::new(w as f64, h as f64);
+        }
+    }
+    (GET_SIZE.get().unwrap())(this, sel)
+}
+
+unsafe extern "C-unwind" fn set_size_hook(this: *mut CAMetalLayer, sel: Sel, size: CGSize) {
+    // a vulkan driver sizes its own layers; the proxy sizes its layer past the swizzle
+    if SCALING.load(Ordering::Relaxed) && !is_vulkan_layer(&*this) {
+        let game = (size.width.round() as u32, size.height.round() as u32);
+        if Generator::existing(&*this).is_some_and(|g| g.game_sets_size(game)) {
+            return;
+        }
+    }
+    (SET_SIZE.get().unwrap())(this, sel, size)
 }
 
 // probe a command buffer of the layer's device (or the default device) and hook its concrete class
@@ -265,12 +330,29 @@ unsafe extern "C-unwind" fn next_drawable_hook(
 ) -> *mut AnyObject {
     let layer = &*this;
     INIT.call_once(|| {
-        if super::setup().is_some_and(|s| s.profile.multiplier > 1) {
+        SCALING.store(super::setup().is_some_and(|s| s.profile.scaler != ScalerMode::Off), Ordering::Relaxed);
+        if super::setup().is_some_and(|s| s.profile.active()) {
             set_enabled(true);
             log::info("lsfg-metal metal front end active");
         }
     });
-    if enabled() && !is_vulkan_layer(layer) && layer_supported(layer) {
+    // a front end turned off by a failure no longer refreshes the upscale: back to the game's size
+    if !enabled() && UPSCALED.load(Ordering::Relaxed) && !is_vulkan_layer(layer) {
+        if let Some(gen) = Generator::existing(layer) {
+            if let Some((game, _)) = gen.upscaling() {
+                gen.set_upscaling(None, game);
+            }
+        }
+    }
+    // multiplier 1 only takes over a layer it upscales
+    let wanted = |gen: &Generator| {
+        let Some(s) = super::setup() else { return false };
+        if s.profile.scaler != ScalerMode::Off {
+            gen.refresh_upscale(gen.colour_kind());
+        }
+        s.profile.multiplier > 1 || gen.upscaling().is_some()
+    };
+    if enabled() && !is_vulkan_layer(layer) && layer_supported(layer) && Generator::get(layer).is_some_and(wanted) {
         install_cb_hooks(layer);
         if layer.maximumDrawableCount() < 3 {
             layer.setMaximumDrawableCount(3);

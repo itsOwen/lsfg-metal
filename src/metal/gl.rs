@@ -14,16 +14,16 @@ use objc2_io_surface::{
     IOSurfaceRef,
 };
 use objc2_metal::{
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureUsage,
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice,
+    MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
 use super::generator::{image_info, import_texture, native_off, Backend, Built, Native, Unshared, Wrapper, GPU_TIMEOUT};
-use super::{enabled, now, set_enabled, setup, Setup};
+use super::{enabled, metalfx, now, set_enabled, setup, Setup};
 use crate::generator::signature::{Colour, Signature};
 use crate::log;
 use crate::pacer::{display_refresh, Estimator, Pacer, Sample};
-use crate::settings::PacingMode;
+use crate::settings::{PacingMode, ScalerMode};
 use crate::vkutil::{self, check};
 
 type FlushFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
@@ -32,6 +32,10 @@ type FlushFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
 extern "C" {
     fn CGLGetCurrentContext() -> *mut c_void;
     fn CGLSetParameter(ctx: *mut c_void, pname: i32, params: *const i32) -> i32;
+    fn CGLGetParameter(ctx: *mut c_void, pname: i32, params: *mut i32) -> i32;
+    fn CGLEnable(ctx: *mut c_void, pname: i32) -> i32;
+    fn CGLDisable(ctx: *mut c_void, pname: i32) -> i32;
+    fn CGLIsEnabled(ctx: *mut c_void, pname: i32, enabled: *mut i32) -> i32;
     fn CGLTexImageIOSurface2D(
         ctx: *mut c_void,
         target: u32,
@@ -99,13 +103,15 @@ const GL_FRAMEBUFFER_SRGB: u32 = 0x8DB9;
 const GL_BACK: u32 = 0x0405;
 const GL_READ_BUFFER: u32 = 0x0C02;
 const CGL_SWAP_INTERVAL: i32 = 222;
+const CGL_SURFACE_BACKING_SIZE: i32 = 304;
+const CGL_ENABLE_SURFACE_BACKING_SIZE: i32 = 305;
 const BGRA: i32 = i32::from_be_bytes(*b"BGRA");
 
 static FLUSH: OnceLock<FlushFn> = OnceLock::new();
 
 // swizzle -[NSOpenGLContext flushBuffer]; the original is published before the swap
 pub fn install() {
-    if FLUSH.get().is_some() || setup().is_none_or(|s| s.profile.multiplier < 2) {
+    if FLUSH.get().is_some() || setup().is_none_or(|s| !s.profile.active()) {
         return;
     }
     let Some(m) =
@@ -157,6 +163,19 @@ struct Context {
     // seconds the game spent in generated swaps during the previous frame
     held: f64,
     stats: Stats,
+    up: Option<Up>,
+}
+
+// metalfx for one context: the surface is pinned to the shown size, the game keeps drawing its own size in its corner
+struct Up {
+    shown: (u32, u32),
+    out: Surface,
+    mid: Retained<ProtocolObject<dyn MTLTexture>>,
+    scaler: metalfx::Scaler,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    // the backing size set before ours, restored on release; nothing to restore until pinned
+    prior: Option<[i32; 2]>,
+    pinned: bool,
 }
 
 #[derive(Default)]
@@ -176,7 +195,12 @@ struct Front {
     pending: HashMap<usize, ((u32, u32), Built)>,
     // contexts that fell back to native swaps, including ones whose setup failed
     failed: HashSet<usize>,
+    // upscale only, at multiplier 1, per context: the sizes it was set up for, and the game's frame with its scaler unless that failed
+    plain: HashMap<usize, Plain>,
 }
+
+// game size, shown size, and the game's frame with its scaler unless that failed
+type Plain = ((u32, u32), (u32, u32), Option<(Surface, Up)>);
 
 // metal textures and iosurfaces are thread-safe objects; every access goes through FRONT's lock
 unsafe impl Send for Front {}
@@ -190,38 +214,56 @@ unsafe extern "C-unwind" fn flush_hook(this: *mut AnyObject, sel: Sel) {
     if !enabled() || cgl.is_null() {
         return orig(this, sel);
     }
-    let Some(extent) = drawable_size(this) else {
+    let Some((extent, shown)) = drawable_size(this) else {
         return orig(this, sel);
     };
     let entered = now();
     let mut guard = FRONT.lock().unwrap();
     let front = guard.get_or_insert_with(Front::default);
     // the game's gl thread may have no pool, and the native generator autoreleases its encoders
-    let made = objc2::rc::autoreleasepool(|_| generate(front, cgl, extent, entered, || orig(this, sel)));
+    let made = objc2::rc::autoreleasepool(|_| generate(front, cgl, extent, shown, entered, || orig(this, sel)));
     if let Err(e) = made {
         log::error("OpenGL frame generation failed, presenting natively from now on:");
         log::error(&format!("- {e}"));
         if let Some(c) = front.contexts.remove(&(cgl as usize)) {
             c.destroy(front.backend.as_ref());
         }
+        if let Some((_, _, Some((src, u)))) = front.plain.remove(&(cgl as usize)) {
+            u.release(cgl);
+            src.delete();
+        }
         front.failed.insert(cgl as usize);
         orig(this, sel);
     }
 }
 
-// the default framebuffer's pixel size, which follows the view's backing store when it asks for one
-unsafe fn drawable_size(ctx: *mut AnyObject) -> Option<(u32, u32)> {
+// once per process: the scaler is set but this context shows at the game's size
+fn not_upscaled(extent: (u32, u32)) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::info(&format!(
+            "MetalFX upscaling not used for OpenGL: the view is not larger than {}x{} in pixels, or MetalFX cannot run here",
+            extent.0, extent.1
+        ))
+    });
+}
+
+// the default framebuffer's pixel size, which follows the view's backing store when it asks for one, and the view in physical pixels
+unsafe fn drawable_size(ctx: *mut AnyObject) -> Option<((u32, u32), (u32, u32))> {
     let view: *mut AnyObject = msg_send![ctx, view];
     if view.is_null() {
         return None;
     }
     let mut r: CGRect = msg_send![view, bounds];
     let best: Bool = msg_send![view, wantsBestResolutionOpenGLSurface];
+    let scaling = setup().is_some_and(|s| s.profile.scaler != ScalerMode::Off);
+    let scale = if best.as_bool() || !scaling { 1.0 } else { metalfx::screen_scale() };
     if best.as_bool() {
         r = msg_send![view, convertRectToBacking: r];
     }
     let (w, h) = (r.size.width.round() as u32, r.size.height.round() as u32);
-    (w > 0 && h > 0).then_some((w, h))
+    let shown = ((r.size.width * scale).round() as u32, (r.size.height * scale).round() as u32);
+    (w > 0 && h > 0).then_some(((w, h), shown))
 }
 
 // framebuffer bindings, the default read buffer, scissor and srgb, restored on drop
@@ -284,6 +326,7 @@ unsafe fn generate(
     front: &mut Front,
     cgl: *mut c_void,
     extent: (u32, u32),
+    shown: (u32, u32),
     entered: f64,
     present: impl Fn(),
 ) -> Result<(), String> {
@@ -291,6 +334,42 @@ unsafe fn generate(
     let p = &s.profile;
     let key = cgl as usize;
     if front.failed.contains(&key) {
+        present();
+        return Ok(());
+    }
+    let upscale = p.scaler == ScalerMode::MetalFx && shown.0 > extent.0 && shown.1 > extent.1;
+    // multiplier 1 only upscales: the game's frame through metalfx, no generator
+    if p.multiplier < 2 {
+        if front.plain.get(&key).is_none_or(|(e, s, _)| (*e, *s) != (extent, shown)) {
+            if let Some((_, _, Some((src, u)))) = front.plain.remove(&key) {
+                u.release(cgl);
+                src.delete();
+            }
+            let made = match upscale.then(|| Up::new(cgl, extent, shown)).flatten() {
+                Some(u) => match Surface::new(None, cgl, extent) {
+                    Ok(src) => Some((src, u)),
+                    Err(e) => {
+                        u.release(cgl);
+                        return Err(e);
+                    }
+                },
+                None => {
+                    not_upscaled(extent);
+                    None
+                }
+            };
+            front.plain.insert(key, (extent, shown, made));
+        }
+        let Some((_, _, Some((src, u)))) = front.plain.get_mut(&key) else {
+            present();
+            return Ok(());
+        };
+        let saved = Saved::take();
+        blit(0, src.fbo, extent);
+        glFinish();
+        u.pin(cgl);
+        u.show(&src.texture)?;
+        drop(saved);
         present();
         return Ok(());
     }
@@ -320,6 +399,11 @@ unsafe fn generate(
             "OpenGL presentation {}x{}, {mode} {}, flow {:.2}",
             extent.0, extent.1, p.multiplier, p.flow_for(extent.1)
         ));
+        let mut c = c;
+        c.up = upscale.then(|| Up::new(cgl, extent, shown)).flatten();
+        if p.scaler != ScalerMode::Off && c.up.is_none() {
+            not_upscaled(extent);
+        }
         front.contexts.insert(key, c);
     }
     let c = front.contexts.get_mut(&key).unwrap();
@@ -339,6 +423,9 @@ unsafe fn generate(
     blit(0, c.surfaces[0].fbo, extent);
     // glfinish waits on the game's frame; a gl sync object would let the generator start earlier
     glFinish();
+    if let Some(u) = &mut c.up {
+        u.pin(cgl);
+    }
     match &mut c.engine {
         Engine::Native(n) => {
             n.begin();
@@ -393,7 +480,7 @@ unsafe fn generate(
                 check(d.reset_fences(&[v.fence]), "vkResetFences")?;
             }
         }
-        blit(c.surfaces[1 + i].fbo, 0, extent);
+        c.show(1 + i, extent)?;
         if i + 1 == inserted && !show_original {
             drop(saved);
             present();
@@ -407,7 +494,7 @@ unsafe fn generate(
     }
     c.held = now() - held_from;
     // the back buffer is undefined after a swap, so the original frame comes back from its copy
-    blit(c.surfaces[0].fbo, 0, extent);
+    c.show(0, extent)?;
     drop(saved);
     present();
     c.stats.original += 1;
@@ -508,20 +595,16 @@ impl Context {
             estimator: Estimator::default(),
             held: 0.0,
             stats: Stats::default(),
+            up: None,
         };
         let built = (|| {
             if let (Engine::Vulkan(v), Some(b)) = (&mut c.engine, b) {
                 v.mark = vkutil::create_semaphore(&b.device, true)?;
                 v.fence = vkutil::create_fence(&b.device)?;
             }
-            let mut prior = 0i32;
-            glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &mut prior);
-            let made = (0..=m).try_for_each(|_| {
+            for _ in 0..=m {
                 c.surfaces.push(Surface::new(b, cgl, extent)?);
-                Ok::<_, String>(())
-            });
-            glBindTexture(GL_TEXTURE_RECTANGLE, prior as u32);
-            made?;
+            }
             if let (Engine::Vulkan(v), Some(b)) = (&mut c.engine, b) {
                 for _ in 0..=m {
                     v.cmd.push(vkutil::allocate_command_buffer(&b.device, b.pool)?);
@@ -560,8 +643,22 @@ impl Context {
         ));
     }
 
+    // a frame into the default framebuffer, through metalfx when upscaling
+    unsafe fn show(&self, k: usize, extent: (u32, u32)) -> Result<(), String> {
+        match &self.up {
+            Some(u) => u.show(&self.surfaces[k].texture),
+            None => {
+                blit(self.surfaces[k].fbo, 0, extent);
+                Ok(())
+            }
+        }
+    }
+
     // the backend is none only for a native context
     fn destroy(mut self, b: Option<&Backend>) {
+        if let Some(u) = self.up.take() {
+            unsafe { u.release(CGLGetCurrentContext()) };
+        }
         match (&mut self.engine, b) {
             (Engine::Native(n), _) => {
                 let _ = n.settle();
@@ -594,7 +691,99 @@ impl Context {
     }
 }
 
+impl Up {
+    // none when metalfx cannot run here; the surface stays as the game set it
+    unsafe fn new(cgl: *mut c_void, extent: (u32, u32), shown: (u32, u32)) -> Option<Up> {
+        let device = MTLCreateSystemDefaultDevice()?;
+        let scaler = metalfx::Scaler::new(&device, extent, shown, MTLPixelFormat::BGRA8Unorm, 0)?;
+        let desc = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::BGRA8Unorm,
+            shown.0 as usize,
+            shown.1 as usize,
+            false,
+        );
+        desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite | MTLTextureUsage::RenderTarget);
+        desc.setStorageMode(MTLStorageMode::Private);
+        let mid = device.newTextureWithDescriptor(&desc)?;
+        let queue = device.newCommandQueue()?;
+        let out = Surface::new(None, cgl, shown).ok()?;
+        log::info(&format!(
+            "MetalFX upscaling {}x{} to {}x{}",
+            extent.0, extent.1, shown.0, shown.1
+        ));
+        Some(Up {
+            shown,
+            out,
+            mid,
+            scaler,
+            queue,
+            prior: None,
+            pinned: false,
+        })
+    }
+
+    // the surface at the shown size, checked every frame: wine drops its own pin when a window is hidden or a pbuffer is made current
+    unsafe fn pin(&mut self, cgl: *mut c_void) {
+        let mut on = 0;
+        let mut size = [0i32; 2];
+        let enabled = CGLIsEnabled(cgl, CGL_ENABLE_SURFACE_BACKING_SIZE, &mut on) == 0 && on != 0;
+        if enabled && CGLGetParameter(cgl, CGL_SURFACE_BACKING_SIZE, size.as_mut_ptr()) != 0 {
+            size = [0, 0];
+        }
+        let shown = [self.shown.0 as i32, self.shown.1 as i32];
+        if enabled && size == shown {
+            return;
+        }
+        log::debug(&format!(
+            "OpenGL surface pinned to {}x{} again (it was {})",
+            shown[0],
+            shown[1],
+            if enabled { format!("{}x{}", size[0], size[1]) } else { "unpinned".into() }
+        ));
+        // whatever stands now is what the game or wine wants back later
+        self.prior = enabled.then_some(size);
+        self.pinned = true;
+        CGLSetParameter(cgl, CGL_SURFACE_BACKING_SIZE, shown.as_ptr());
+        CGLEnable(cgl, CGL_ENABLE_SURFACE_BACKING_SIZE);
+    }
+
+    // the frame scaled into the shared surface, then drawn over the whole default framebuffer
+    unsafe fn show(&self, src: &ProtocolObject<dyn MTLTexture>) -> Result<(), String> {
+        // the previous frame's gl copy out of the shared surface must be done before metal writes it again
+        glFinish();
+        let cb = self.queue.commandBuffer().ok_or("no Metal command buffer")?;
+        self.scaler.encode(&cb, src, &self.mid);
+        let copy = cb.blitCommandEncoder().ok_or("no Metal blit encoder")?;
+        copy.copyFromTexture_toTexture(&self.mid, &self.out.texture);
+        copy.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        blit(self.out.fbo, 0, self.shown);
+        Ok(())
+    }
+
+    // the surface back to the size it had before
+    unsafe fn release(self, cgl: *mut c_void) {
+        if self.pinned && !cgl.is_null() {
+            match self.prior {
+                Some(p) => {
+                    CGLSetParameter(cgl, CGL_SURFACE_BACKING_SIZE, p.as_ptr());
+                }
+                None => {
+                    CGLDisable(cgl, CGL_ENABLE_SURFACE_BACKING_SIZE);
+                }
+            }
+        }
+        self.out.delete();
+    }
+}
+
 impl Surface {
+    unsafe fn delete(self) {
+        glDeleteFramebuffers(1, &self.fbo);
+        glDeleteTextures(1, &self.gl_texture);
+    }
+
     unsafe fn new(b: Option<&Backend>, cgl: *mut c_void, (w, h): (u32, u32)) -> Result<Surface, String> {
         let keys = [
             kIOSurfaceWidth,
@@ -631,6 +820,9 @@ impl Surface {
             .ok_or("unable to wrap an IOSurface in a Metal texture")?;
         let mut gl_texture = 0;
         glGenTextures(1, &mut gl_texture);
+        // the game's own rectangle texture stays bound
+        let mut bound = 0i32;
+        glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &mut bound);
         glBindTexture(GL_TEXTURE_RECTANGLE, gl_texture);
         let err = CGLTexImageIOSurface2D(
             cgl,
@@ -643,6 +835,7 @@ impl Surface {
             &*surface,
             0,
         );
+        glBindTexture(GL_TEXTURE_RECTANGLE, bound as u32);
         let mut fbo = 0;
         glGenFramebuffers(1, &mut fbo);
         let mut prior = 0i32;

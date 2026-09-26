@@ -13,6 +13,7 @@ use block2::RcBlock;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2::Message;
+use objc2_core_graphics::CGColorSpace;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable, MTLEvent, MTLGPUFamily, MTLOrigin, MTLPixelFormat,
@@ -23,12 +24,13 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use super::drawable::ProxyDrawable;
 use super::latency;
+use super::metalfx;
 use super::{enabled, hooks, set_enabled, setup, vk_format, Setup};
 use crate::generator::signature::{Colour, Signature};
 use crate::generator::{native, Context, Instance};
 use crate::log;
 use crate::pacer::{display_refresh, Estimator, Pacer, Sample};
-use crate::settings::PacingMode;
+use crate::settings::{PacingMode, ScalerMode};
 use crate::shaders;
 use crate::vkutil::{self, check};
 
@@ -59,6 +61,13 @@ struct Pool {
     next_id: usize,
 }
 
+// (game size, shown size) of an upscaled layer
+pub type Upscale = ((u32, u32), (u32, u32));
+// game size, shown size, format and colour kind of a scaler
+type ScaleKey = ((u32, u32), (u32, u32), MTLPixelFormat, u32);
+// a pixel format and colour space with the colour kind they classify as
+type ColourCache = Option<(MTLPixelFormat, Option<Retained<CGColorSpace>>, Option<u32>)>;
+
 pub struct Generator {
     latency: latency::Probe,
     pub layer: Retained<CAMetalLayer>,
@@ -75,6 +84,15 @@ pub struct Generator {
     started: Once,
     pool: Mutex<Pool>,
     pool_cv: Condvar,
+    upscale: Mutex<Option<Upscale>>,
+    // held across a state change and the real resize, never while only reading, so the size getter cannot wait on core animation
+    sizing: Mutex<()>,
+    // a size the game set itself; none follows the layer's natural size
+    explicit: Mutex<Option<(u32, u32)>>,
+    // whether a scaler builds for this key
+    tried: Mutex<Option<(ScaleKey, bool)>>,
+    // the colour kind last worked out, with the format and colour space it was for; classifying costs core graphics calls
+    colour: Mutex<ColourCache>,
 }
 unsafe impl Send for Generator {}
 unsafe impl Sync for Generator {}
@@ -90,6 +108,9 @@ impl Generator {
             return Some(g);
         }
         let device = layer.device().or_else(|| MTLCreateSystemDefaultDevice())?;
+        // a size the game set before this generator existed went past the size hook
+        let real = hooks::real_drawable_size(layer);
+        let explicit = (real.0 > 0 && real.1 > 0 && real != natural_size(layer)).then_some(real);
         let (tx, rx) = channel();
         let g = Box::leak(Box::new(Generator {
             latency: latency::Probe::default(),
@@ -111,9 +132,155 @@ impl Generator {
                 next_id: 1,
             }),
             pool_cv: Condvar::new(),
+            upscale: Mutex::new(None),
+            sizing: Mutex::new(()),
+            explicit: Mutex::new(explicit),
+            tried: Mutex::new(None),
+            colour: Mutex::new(None),
         }));
         map.insert(layer as *const _ as usize, g);
         Some(g)
+    }
+
+    // the size the game draws at: its own while upscaling, else the layer's
+    pub fn game_size(&self) -> (f64, f64) {
+        match self.upscaling() {
+            Some(((w, h), _)) => (w as f64, h as f64),
+            None => {
+                let s = self.layer.drawableSize();
+                (s.width, s.height)
+            }
+        }
+    }
+
+    pub fn upscaling(&self) -> Option<Upscale> {
+        *self.upscale.lock().unwrap()
+    }
+
+    // upscale from the game's size, or not, with the real drawables resized in the same step
+    pub fn set_upscaling(&self, up: Option<Upscale>, game: (u32, u32)) {
+        let _sizing = self.sizing.lock().unwrap();
+        if up.is_some() {
+            hooks::mark_upscaled();
+        }
+        *self.upscale.lock().unwrap() = up;
+        hooks::set_real_drawable_size(&self.layer, up.map_or(game, |u| u.1));
+    }
+
+    // forget the state without touching the size, for a layer a vulkan driver takes over
+    pub fn clear_upscaling(&self) {
+        *self.upscale.lock().unwrap() = None;
+    }
+
+    // back to the game's size when the scale that failed is still the current one; it is not tried again
+    fn stop_upscaling(&self, key: Upscale, why: &str) {
+        let _sizing = self.sizing.lock().unwrap();
+        {
+            let mut state = self.upscale.lock().unwrap();
+            if *state != Some(key) {
+                return;
+            }
+            *state = None;
+        }
+        if let Some(t) = self.tried.lock().unwrap().as_mut().filter(|t| (t.0 .0, t.0 .1) == key) {
+            t.1 = false;
+        }
+        hooks::set_real_drawable_size(&self.layer, key.0);
+        log::warn(&format!("MetalFX upscaling off for this layer ({why}); frames show at the game's size"));
+    }
+
+    // the generator of a layer, without creating one
+    pub fn existing(layer: &CAMetalLayer) -> Option<&'static Generator> {
+        GENERATORS.lock().unwrap().as_ref()?.get(&(layer as *const _ as usize)).copied()
+    }
+
+    // the shown size when metalfx should upscale this layer from `game`; the scaler is tried once per key
+    pub fn upscale_to(&self, game: (u32, u32), format: MTLPixelFormat, kind: u32) -> Option<(u32, u32)> {
+        if !setup().is_some_and(|s| s.profile.scaler == ScalerMode::MetalFx) {
+            return None;
+        }
+        let shown = metalfx::shown_size(&self.layer);
+        if shown.0 <= game.0 || shown.1 <= game.1 {
+            // a game already at the window's full size has nothing to upscale; say so once, as the opengl path does
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                log::info(&format!(
+                    "MetalFX upscaling not used: the game presents at {}x{}, not smaller than the window's {}x{} pixels",
+                    game.0, game.1, shown.0, shown.1
+                ))
+            });
+            return None;
+        }
+        let key = (game, shown, format, kind);
+        let mut tried = self.tried.lock().unwrap();
+        if tried.is_none_or(|t| t.0 != key) {
+            // on the game's thread, which may have no pool of its own
+            let ok = autoreleasepool(|_| {
+                metalfx::Scaler::new(&self.device, game, shown, unorm(format), kind).is_some()
+            });
+            if !ok {
+                log::info(&format!(
+                    "MetalFX upscaling not used: MetalFX cannot scale {}x{} to {}x{} here (it needs macOS 13 and a GPU it supports)",
+                    game.0, game.1, shown.0, shown.1
+                ));
+            }
+            *tried = Some((key, ok));
+        }
+        tried.is_some_and(|t| t.1).then_some(shown)
+    }
+
+    // the layer's colour kind, worked out again only when its pixel format or colour space changes
+    pub fn colour_kind(&self) -> Option<u32> {
+        let format = self.layer.pixelFormat();
+        let space = self.layer.colorspace();
+        let mut cached = self.colour.lock().unwrap();
+        if let Some((f, s, kind)) = &*cached {
+            // the cache holds the space it saw, so a new one can never reuse its address
+            if *f == format && s.as_deref().map(|s| s as *const _) == space.as_deref().map(|s| s as *const _) {
+                return *kind;
+            }
+        }
+        let kind = hooks::colour(format, space.as_deref()).map(|c| c.kind);
+        *cached = Some((format, space, kind));
+        kind
+    }
+
+    // metal front end, every nextDrawable: follow the game's size and the window, start or stop upscaling
+    pub fn refresh_upscale(&self, kind: Option<u32>) {
+        let natural = natural_size(&self.layer);
+        let current = self.upscaling();
+        // the size the game set, else the natural size a layer follows until it is sized
+        let explicit = *self.explicit.lock().unwrap();
+        let game = explicit.unwrap_or(natural);
+        if game.0 == 0 || game.1 == 0 {
+            return;
+        }
+        let up = kind.and_then(|k| self.upscale_to(game, self.layer.pixelFormat(), k));
+        match (up, current) {
+            (Some(shown), Some(c)) if c == (game, shown) => {}
+            (Some(shown), _) => {
+                self.set_upscaling(Some((game, shown)), game);
+                log::info(&format!("MetalFX upscaling {}x{} to {}x{}", game.0, game.1, shown.0, shown.1));
+            }
+            (None, Some(_)) => self.set_upscaling(None, game),
+            // after upscaling stopped the size was set for the game; one that never set its own follows the window again
+            (None, None) => {
+                if explicit.is_none() && hooks::real_drawable_size(&self.layer) != natural {
+                    hooks::set_real_drawable_size(&self.layer, natural);
+                }
+            }
+        }
+    }
+
+    // the game sets a size: remembered as its own; on an upscaled layer the real drawables keep the shown size
+    pub fn game_sets_size(&self, size: (u32, u32)) -> bool {
+        *self.explicit.lock().unwrap() = Some(size);
+        let mut up = self.upscale.lock().unwrap();
+        let Some((game, shown)) = *up else { return false };
+        if size != game {
+            *up = Some((size, shown));
+        }
+        true
     }
 
     pub fn game_event(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
@@ -162,15 +329,11 @@ impl Generator {
 
     // pool of drawables handed to the game, at most three outstanding
     pub fn acquire_drawable(&'static self) -> Option<Retained<ProxyDrawable>> {
-        let size = self.layer.drawableSize();
-        if size.width < 1.0 || size.height < 1.0 {
+        let size = self.game_size();
+        if size.0 < 1.0 || size.1 < 1.0 {
             return None;
         }
-        let (w, h, format) = (
-            size.width as usize,
-            size.height as usize,
-            self.layer.pixelFormat(),
-        );
+        let (w, h, format) = (size.0 as usize, size.1 as usize, self.layer.pixelFormat());
         let mut pool = self.pool.lock().unwrap();
         while pool.outstanding >= 3 {
             // like the real layer's one-second nextDrawable timeout: the caller gets a real drawable
@@ -234,9 +397,15 @@ impl Generator {
             job.latency.start();
             log::error("Metal presentation worker is gone, presenting natively from now on");
             set_enabled(false);
-            present_natively(self, &job);
+            present_natively(self, &job, None);
         }
     }
+}
+
+// bounds times scale, the size a layer's drawables follow until it is sized
+fn natural_size(layer: &CAMetalLayer) -> (u32, u32) {
+    let (b, s) = (layer.bounds().size, layer.contentsScale());
+    ((b.width * s).round() as u32, (b.height * s).round() as u32)
 }
 
 // metal has no timed wait; poll the status with a deadline, false on timeout
@@ -861,19 +1030,71 @@ impl Native {
 
 // srgb drawables go through a unorm view, so copies move the encoded bytes instead of converting them
 fn unorm_view(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Texture, &'static str> {
-    let unorm = match texture.pixelFormat() {
-        MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
-        MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
-        MTLPixelFormat::BGR10_XR_sRGB => Some(MTLPixelFormat::BGR10_XR),
-        MTLPixelFormat::BGRA10_XR_sRGB => Some(MTLPixelFormat::BGRA10_XR),
-        _ => None,
-    };
-    match unorm {
-        Some(f) => texture
+    let format = texture.pixelFormat();
+    match unorm(format) {
+        f if f != format => texture
             .newTextureViewWithPixelFormat(f)
             .ok_or("could not create a unorm view of an srgb drawable"),
-        None => Ok(texture.retain()),
+        _ => Ok(texture.retain()),
     }
+}
+
+pub(super) fn unorm(format: MTLPixelFormat) -> MTLPixelFormat {
+    match format {
+        MTLPixelFormat::BGRA8Unorm_sRGB => MTLPixelFormat::BGRA8Unorm,
+        MTLPixelFormat::RGBA8Unorm_sRGB => MTLPixelFormat::RGBA8Unorm,
+        MTLPixelFormat::BGR10_XR_sRGB => MTLPixelFormat::BGR10_XR,
+        MTLPixelFormat::BGRA10_XR_sRGB => MTLPixelFormat::BGRA10_XR,
+        other => other,
+    }
+}
+
+// metalfx from the game's size into an intermediate that is copied into the real drawable
+struct Scale {
+    key: ScaleKey,
+    scaler: metalfx::Scaler,
+    // metalfx writes only private textures, and drawables are managed
+    out: Texture,
+    // generated frames at the game's size, for the scaler to read
+    stage: Option<Texture>,
+}
+
+impl Scale {
+    // unorm views on both sides, in the scale's format
+    fn encode(
+        &self,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        src: &ProtocolObject<dyn MTLTexture>,
+        dst: &ProtocolObject<dyn MTLTexture>,
+    ) -> Result<(), &'static str> {
+        self.scaler.encode(cb, src, &self.out);
+        let blit = cb.blitCommandEncoder().ok_or("no Metal blit encoder")?;
+        unsafe { blit.copyFromTexture_toTexture(&self.out, dst) };
+        blit.endEncoding();
+        Ok(())
+    }
+}
+
+// built on first use and again when the sizes or format change; a failure turns upscaling off for the layer
+fn scale_for<'a>(
+    slot: &'a mut Option<Scale>,
+    gen: &Generator,
+    format: MTLPixelFormat,
+    (game, shown): Upscale,
+    kind: u32,
+) -> Result<&'a mut Scale, Fail> {
+    let key = (game, shown, format, kind);
+    if slot.as_ref().is_none_or(|s| s.key != key) {
+        *slot = None;
+        let built = metalfx::Scaler::new(&gen.device, game, shown, format, kind)
+            .zip(gen.new_texture(shown.0 as usize, shown.1 as usize, format));
+        let Some((scaler, out)) = built else {
+            gen.stop_upscaling((game, shown), &format!("no MetalFX scaler for pixel format {}", format.0));
+            return Err(Fail::Skip("no MetalFX scaler".into()));
+        };
+        *slot = Some(Scale { key, scaler, out, stage: None });
+    }
+    Ok(slot.as_mut().unwrap())
 }
 
 // one pixel of a dumped frame, deeper than 8 bits, as rgb floats
@@ -958,6 +1179,15 @@ struct Worker {
     stats: Stats,
     stats_on: bool,
     dump_dir: Option<PathBuf>,
+    // metalfx on the native queue, and on the present queue for frames shown as they are
+    scale: Option<Scale>,
+    plain: Option<Scale>,
+    // moltenvk writes each shown frame at the game's size here; the present scales it
+    ring: Vec<Texture>,
+    ring_next: usize,
+    staged: Option<Texture>,
+    // the layer's upscaling as this job started; a swapchain recreated meanwhile cannot mix sizes within a frame
+    up: Option<Upscale>,
 }
 
 impl Worker {
@@ -987,6 +1217,12 @@ impl Worker {
             dump_dir: std::env::var_os("LSFGM_METAL_DUMP")
                 .filter(|d| !d.is_empty())
                 .map(PathBuf::from),
+            scale: None,
+            plain: None,
+            ring: Vec::new(),
+            ring_next: 0,
+            staged: None,
+            up: None,
         }
     }
 
@@ -1019,7 +1255,8 @@ impl Worker {
             self.stats.seconds += job.sample.interval;
             self.stats.samples += 1;
         }
-        if !enabled() {
+        // multiplier 1 only upscales
+        if !enabled() || self.setup.profile.multiplier < 2 {
             return self.present_natively(job);
         }
         match self.generate(job) {
@@ -1057,6 +1294,7 @@ impl Worker {
         }
         // each view holds its drawable, so old-size ones would live on
         self.views.clear();
+        self.ring.clear();
         self.extent = (0, 0);
     }
 
@@ -1090,6 +1328,7 @@ impl Worker {
                 Some(Ok(Ok(n))) => {
                     self.pending = None;
                     self.reset();
+                    self.plain = None;
                     self.announce(texture, colour);
                     self.native = Some(n.0);
                     (self.extent, self.format, self.pixel_format, self.colour) = ((w, h), format, texture.pixelFormat(), colour);
@@ -1192,7 +1431,8 @@ impl Worker {
         if let Some(v) = self.views.get(&key) {
             return Ok(v.clone());
         }
-        if (texture.width() as u32, texture.height() as u32) != self.extent
+        let size = (texture.width() as u32, texture.height() as u32);
+        if (size != self.extent && Some(size) != self.up.map(|u| u.1))
             || (texture.pixelFormat() != self.pixel_format && vk_format(texture.pixelFormat()).ok() != Some(self.format))
         {
             return Err(Fail::Mismatch(
@@ -1254,13 +1494,22 @@ impl Worker {
 
     // a present command buffer that waits for the pipeline, never blocking the worker
     fn present_when_ready(
-        &self,
+        &mut self,
         target: &ProtocolObject<dyn CAMetalDrawable>,
         duration: f64,
         value: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fail> {
         let cb = self.present_cb()?;
         cb.encodeWaitForEvent_value(self.present_event(), value);
+        if let (Some(staged), Some(up)) = (self.staged.take(), self.up) {
+            let dst = unorm_view(&target.texture())?;
+            // only moltenvk stages, so a skip here is past start() too
+            let scale = scale_for(&mut self.plain, self.gen, staged.pixelFormat(), up, self.colour.kind).map_err(|e| match e {
+                Fail::Skip(what) => Fail::Mismatch(what),
+                e => e,
+            })?;
+            scale.encode(&cb, &staged, &dst)?;
+        }
         present(&cb, ProtocolObject::from_ref(target), duration);
         cb.commit();
         Ok(())
@@ -1320,6 +1569,41 @@ impl Worker {
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
         b.submit(&[cb], &[], &[signal], fence)
+    }
+
+    // while upscaling, a real drawable of another size or format belongs to a layer changed since this job began
+    fn shown(&self, target: &ProtocolObject<dyn MTLTexture>) -> Result<(), Fail> {
+        match self.up {
+            Some((_, s)) if (target.width() as u32, target.height() as u32) != s => {
+                Err(Fail::Skip("the drawable is from before a resize".into()))
+            }
+            Some(_) if unorm(target.pixelFormat()) != unorm(self.pixel_format) => {
+                Err(Fail::Skip("the drawable's pixel format changed".into()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    // the next ring texture for a frame moltenvk writes at the game's size, scaled by its present
+    fn stage(&mut self, target: &ProtocolObject<dyn MTLTexture>) -> Result<vk::Image, Fail> {
+        // moltenvk took this frame in start(): skipped now, its context would wait on work never submitted
+        if let Err(Fail::Skip(what)) = self.shown(target) {
+            return Err(Fail::Mismatch(what));
+        }
+        let (w, h) = self.extent;
+        // three real drawables bound the presents in flight, so the fourth texture back is never still read
+        if self.ring.len() < 4 {
+            let t = self
+                .gen
+                .new_texture(w as usize, h as usize, unorm(self.pixel_format))
+                .ok_or("no MetalFX stage texture")?;
+            self.ring.push(t);
+        }
+        let t = self.ring[self.ring_next % self.ring.len()].clone();
+        self.ring_next += 1;
+        let image = self.imported(&t)?;
+        self.staged = Some(t);
+        Ok(image)
     }
 
     fn next_real(&self, what: &str) -> Result<Drawable, Fail> {
@@ -1397,14 +1681,34 @@ impl Worker {
         last: bool,
     ) -> Result<u64, Fail> {
         if self.native.is_some() {
+            self.shown(target)?;
             let view = self.view(target)?;
             let ready = self.next_serial();
             let gen = self.gen;
             let event = ProtocolObject::from_ref(&*gen.present_event);
-            self.native.as_mut().unwrap().produce(&view, slot, Some((event, ready)))?;
+            let Some(up) = self.up else {
+                self.native.as_mut().unwrap().produce(&view, slot, Some((event, ready)))?;
+                return Ok(ready);
+            };
+            // generated at the game's size into the stage, then scaled into the drawable
+            let scale = scale_for(&mut self.scale, gen, view.pixelFormat(), up, self.colour.kind)?;
+            if scale.stage.is_none() {
+                let (w, h) = up.0;
+                scale.stage = Some(gen.new_texture(w as usize, h as usize, view.pixelFormat()).ok_or("no MetalFX stage texture")?);
+            }
+            let stage = scale.stage.clone().unwrap();
+            let n = self.native.as_mut().unwrap();
+            n.produce(&stage, slot, None)?;
+            let cb = n.cb()?;
+            scale.encode(&cb, &stage, &view)?;
+            cb.encodeSignalEvent_value(event, ready);
+            n.commit(cb);
             return Ok(ready);
         }
-        let timg = self.imported(target)?;
+        let timg = match self.up {
+            Some(_) => self.stage(target)?,
+            None => self.imported(target)?,
+        };
         let ready = self.next_serial();
         let (_, present, fence) = self.sems.unwrap();
         let (b, cb) = (self.backend.as_ref().unwrap(), self.cmd[1 + i]);
@@ -1426,20 +1730,29 @@ impl Worker {
     ) -> Result<u64, Fail> {
         if self.native.is_some() {
             // unorm views on both sides, so a layer that switched srgb-ness still copies the bytes
+            self.shown(target)?;
             let (src, dst) = (self.view(texture)?, self.view(target)?);
             let ready = self.next_serial();
             let gen = self.gen;
-            let n = self.native.as_mut().unwrap();
-            let cb = n.cb()?;
-            let blit = cb.blitCommandEncoder().ok_or("no Metal blit encoder")?;
-            unsafe { blit.copyFromTexture_toTexture(&src, &dst) };
-            blit.endEncoding();
+            let cb = self.native.as_ref().unwrap().cb()?;
+            match self.up {
+                Some(up) => scale_for(&mut self.scale, gen, src.pixelFormat(), up, self.colour.kind)?.encode(&cb, &src, &dst)?,
+                None => {
+                    let blit = cb.blitCommandEncoder().ok_or("no Metal blit encoder")?;
+                    unsafe { blit.copyFromTexture_toTexture(&src, &dst) };
+                    blit.endEncoding();
+                }
+            }
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*gen.present_event), ready);
+            let n = self.native.as_mut().unwrap();
             n.commit(cb);
             return Ok(ready);
         }
         let source = self.imported(texture)?;
-        let timg = self.imported(target)?;
+        let timg = match self.up {
+            Some(_) => self.stage(target)?,
+            None => self.imported(target)?,
+        };
         let ready = self.next_serial();
         let (_, present, fence) = self.sems.unwrap();
         self.copy(self.cmd[1 + inserted], source, timg, (present, ready), fence)?;
@@ -1449,11 +1762,16 @@ impl Worker {
 
     fn generate(&mut self, job: &mut Job) -> Result<(), Fail> {
         self.settle()?;
+        self.staged = None;
+        self.up = self.gen.upscaling();
         let texture = job.drawable.texture().retain();
         // drawn before a resize: the layer already hands out drawables of the new size, so keep the context for now
-        let size = self.gen.layer.drawableSize();
+        let size = match self.up {
+            Some(((w, h), _)) => (w as f64, h as f64),
+            None => self.gen.game_size(),
+        };
         let near = |v: usize, f: f64| v == f as usize || v == f.round() as usize;
-        if !near(texture.width(), size.width) || !near(texture.height(), size.height) {
+        if !near(texture.width(), size.0) || !near(texture.height(), size.1) {
             return Err(Fail::Skip("the frame is from before a resize".into()));
         }
         self.prepare(&texture)?;
@@ -1543,7 +1861,13 @@ impl Worker {
     }
 
     fn present_natively(&mut self, job: &Job) {
-        if present_natively(self.gen, job) {
+        let gen = self.gen;
+        let texture = job.drawable.texture();
+        let scale = gen.upscaling().and_then(|up| {
+            let kind = hooks::colour(texture.pixelFormat(), gen.layer.colorspace().as_deref())?.kind;
+            scale_for(&mut self.plain, gen, unorm(texture.pixelFormat()), up, kind).ok()
+        });
+        if present_natively(gen, job, scale.as_deref()) {
             self.stats.original += 1;
         }
         self.count_original();
@@ -1668,7 +1992,7 @@ impl Worker {
 }
 
 // false when the frame had to be dropped (its presented handlers still fire)
-fn present_natively(gen: &'static Generator, job: &Job) -> bool {
+fn present_natively(gen: &'static Generator, job: &Job, scale: Option<&Scale>) -> bool {
     if job.serial == 0 {
         if let Some(cb) = &job.cb {
             if !wait_completed(cb) {
@@ -1689,8 +2013,13 @@ fn present_natively(gen: &'static Generator, job: &Job) -> bool {
         cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*gen.game_event), job.serial);
     }
     let (src, dst) = (job.drawable.texture(), real.texture());
+    let sizes = |t: &ProtocolObject<dyn MTLTexture>| (t.width() as u32, t.height() as u32);
     // mid-resize the sizes differ: still present (one blank frame) so the layer settles; skipping stalls the game
-    if src.width() == dst.width()
+    if let Some(s) = scale.filter(|s| (sizes(src), sizes(&dst)) == (s.key.0, s.key.1) && unorm(dst.pixelFormat()) == s.key.2) {
+        if let (Ok(a), Ok(b)) = (unorm_view(src), unorm_view(&dst)) {
+            let _ = s.encode(&cb, &a, &b);
+        }
+    } else if src.width() == dst.width()
         && src.height() == dst.height()
         && src.pixelFormat() == dst.pixelFormat()
     {
