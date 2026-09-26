@@ -300,15 +300,22 @@ pub fn create_buffer(
             req.memory_type_bits,
             true,
             None,
-        )?;
-        check(
+        )
+        .inspect_err(|_| device.destroy_buffer(buffer, None))?;
+        let p = check(
             device.bind_buffer_memory(buffer, mem, 0),
             "vkBindBufferMemory",
-        )?;
-        let p = check(
-            device.map_memory(mem, 0, data.len() as u64, vk::MemoryMapFlags::empty()),
-            "vkMapMemory",
-        )?;
+        )
+        .and_then(|()| {
+            check(
+                device.map_memory(mem, 0, data.len() as u64, vk::MemoryMapFlags::empty()),
+                "vkMapMemory",
+            )
+        })
+        .inspect_err(|_| {
+            device.destroy_buffer(buffer, None);
+            device.free_memory(mem, None);
+        })?;
         std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, data.len());
         device.unmap_memory(mem);
         Ok((buffer, mem))

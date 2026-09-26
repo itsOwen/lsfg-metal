@@ -213,11 +213,12 @@ impl Pipeline {
             if im.is(O) {
                 usage |= vk::ImageUsageFlags::TRANSFER_SRC;
             }
-            let mut img = Img {
+            // owned by self before any handle is made, so a failure part way still destroys them
+            self.imgs.push(Img {
                 handles: vec![],
                 views: vec![],
                 layers: im.layers(),
-            };
+            });
             let mut sub_sizes = vec![];
             for sub in 0..im.sub_images() {
                 let image = vkutil::create_image(
@@ -227,7 +228,7 @@ impl Pipeline {
                     im.layers(),
                     usage,
                 )?;
-                img.handles.push(image);
+                self.imgs[idx].handles.push(image);
                 let r = unsafe { d.get_image_memory_requirements(image) };
                 if im.is(I | O) {
                     let mem = vkutil::allocate(
@@ -259,7 +260,6 @@ impl Pipeline {
                     sub_sizes.push(r.size);
                 }
             }
-            self.imgs.push(img);
             if !im.is(I | O) {
                 internal.push(idx);
                 sizes.push(sub_sizes);

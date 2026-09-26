@@ -213,36 +213,44 @@ impl Library {
             lib.modules.insert((name, perf), m);
             Ok(())
         };
-        let base = [
-            ("mipmaps", MIP_KEY),
-            ("generate_8bit", GEN8_KEY),
-            ("generate_16bit", GEN16_KEY),
-        ];
-        for (i, (name, k)) in base.iter().enumerate() {
-            let w = res
-                .get(k)
-                .ok_or_else(|| format!("Base shader '{name}' missing from DLL"))?;
-            log(&format!(
-                "  {i:2}: name={name}, rid={k:#x}, size={} bytes",
-                w.len()
-            ));
-            make(name, false, w)?;
-            make(name, true, w)?;
-        }
-        for (name, b) in SHADERS {
-            let (q, p) = (key(b, false, fp16), key(b, true, fp16));
-            let missing = || format!("Shader '{name}' missing from DLL");
-            let (wq, wp) = (
-                res.get(&q).ok_or_else(missing)?,
-                res.get(&p).ok_or_else(missing)?,
-            );
-            log(&format!(
-                "  {b:2}: name={name:>8}, [Q] rid={q:2}, size={:5} bytes, [P] rid={p:2}, size={:5} bytes",
-                wq.len(),
-                wp.len()
-            ));
-            make(name, false, wq)?;
-            make(name, true, wp)?;
+        // the library has no drop, so modules made before a failure are destroyed here
+        let loaded = (|| -> Result<(), String> {
+            let base = [
+                ("mipmaps", MIP_KEY),
+                ("generate_8bit", GEN8_KEY),
+                ("generate_16bit", GEN16_KEY),
+            ];
+            for (i, (name, k)) in base.iter().enumerate() {
+                let w = res
+                    .get(k)
+                    .ok_or_else(|| format!("Base shader '{name}' missing from DLL"))?;
+                log(&format!(
+                    "  {i:2}: name={name}, rid={k:#x}, size={} bytes",
+                    w.len()
+                ));
+                make(name, false, w)?;
+                make(name, true, w)?;
+            }
+            for (name, b) in SHADERS {
+                let (q, p) = (key(b, false, fp16), key(b, true, fp16));
+                let missing = || format!("Shader '{name}' missing from DLL");
+                let (wq, wp) = (
+                    res.get(&q).ok_or_else(missing)?,
+                    res.get(&p).ok_or_else(missing)?,
+                );
+                log(&format!(
+                    "  {b:2}: name={name:>8}, [Q] rid={q:2}, size={:5} bytes, [P] rid={p:2}, size={:5} bytes",
+                    wq.len(),
+                    wp.len()
+                ));
+                make(name, false, wq)?;
+                make(name, true, wp)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = loaded {
+            lib.destroy(device);
+            return Err(e);
         }
         log("Shader library ready");
         Ok(lib)

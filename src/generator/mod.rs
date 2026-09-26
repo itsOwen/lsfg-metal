@@ -237,11 +237,13 @@ impl Context {
     ) -> Result<Context, String> {
         let pipeline = Pipeline::new(inst.clone(), w, h, flow, perf, colour)?;
         let d = &inst.device;
-        let (sync, internal, fence) = (
-            vkutil::create_semaphore(d, true)?,
-            vkutil::create_semaphore(d, true)?,
-            vkutil::create_fence(d)?,
-        );
+        let sync = vkutil::create_semaphore(d, true)?;
+        let internal = vkutil::create_semaphore(d, true)
+            .inspect_err(|_| unsafe { d.destroy_semaphore(sync, None) })?;
+        let fence = vkutil::create_fence(d).inspect_err(|_| unsafe {
+            d.destroy_semaphore(sync, None);
+            d.destroy_semaphore(internal, None);
+        })?;
         Ok(Context {
             inst,
             sync,
