@@ -186,15 +186,17 @@ fn render(
             cb.renderCommandEncoderWithDescriptor(&pass)
                 .expect("encoder")
                 .endEncoding();
-            let x = (i * 8) % (w - 32);
-            let y = (i * 8 / (w - 32) * 40) % (h - 32);
-            if target.pixelFormat() != MTLPixelFormat::BGRA8Unorm {
+            // no square when the drawable is too small to move one across
+            let xy = w.checked_sub(32).zip(h.checked_sub(32)).and_then(|(wr, hr)| {
+                Some(((i * 8).checked_rem(wr)?, (i * 8 / wr * 40).checked_rem(hr)?))
+            });
+            let Some((x, y)) = xy.filter(|_| target.pixelFormat() == MTLPixelFormat::BGRA8Unorm) else {
                 let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
                 cb.presentDrawable(d);
                 cb.commit();
                 shown += 1;
                 return;
-            }
+            };
             let blit = cb.blitCommandEncoder().expect("blit");
             unsafe {
                 blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
