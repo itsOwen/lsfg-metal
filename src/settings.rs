@@ -246,7 +246,8 @@ pub fn load_with(env: Env) -> Result<Config, String> {
         return Ok(cfg);
     }
     let path = config_path(env);
-    if path.exists() {
+    // symlink_metadata, so a dangling link (an unmounted dotfile target) is not replaced by the defaults
+    if path.symlink_metadata().is_ok() {
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         cfg = parse(&text, env)?;
@@ -577,18 +578,19 @@ pub fn write(cfg: &Config, path: &Path) -> std::io::Result<()> {
         })
 }
 
-// mtime polling; a failed parse keeps the old mtime so the next call retries, but the error is reported once per mtime
+// mtime polling; a failed parse keeps the old mtime, and the file is retried once its mtime or size changes
 pub struct Watcher {
     path: PathBuf,
-    mtime: (i64, i64),
-    failed: Option<(i64, i64)>,
+    mtime: (i64, i64, u64),
+    failed: Option<(i64, i64, u64)>,
 }
 
-fn mtime(path: &Path) -> (i64, i64) {
+// mtime plus size, so a fix saved within the same timestamp is still picked up
+fn mtime(path: &Path) -> (i64, i64, u64) {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path)
-        .map(|m| (m.mtime(), m.mtime_nsec()))
-        .unwrap_or((-1, -1))
+        .map(|m| (m.mtime(), m.mtime_nsec(), m.len()))
+        .unwrap_or((-1, -1, 0))
 }
 
 impl Watcher {
@@ -603,7 +605,8 @@ impl Watcher {
 
     pub fn check_and_reload(&mut self, env: Env) -> Result<Option<Config>, String> {
         let now = mtime(&self.path);
-        if now == self.mtime || now == (-1, -1) {
+        // a file that already failed at this mtime is not re-read, this runs under the layer lock every present
+        if now == self.mtime || now == (-1, -1, 0) || self.failed == Some(now) {
             return Ok(None);
         }
         match self.reload(env) {
@@ -612,7 +615,6 @@ impl Watcher {
                 self.failed = None;
                 Ok(Some(cfg))
             }
-            Err(_) if self.failed == Some(now) => Ok(None),
             Err(e) => {
                 self.failed = Some(now);
                 Err(e)
@@ -1180,6 +1182,17 @@ mod tests {
         // and the kill switch still beats everything
         assert_eq!(identify_with(&cfg, &env(&[("LSFGM_DISABLE", "")])), None);
         assert_eq!(Method::CatchAll.name(), "catch-all profile");
+    }
+
+    #[test]
+    fn dangling_symlink_is_not_replaced() {
+        let dir = tmp("dangling");
+        let path = dir.join("lsfg-metal/conf.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing.toml"), &path).unwrap();
+        let e = env(&[("XDG_CONFIG_HOME", dir.to_str().unwrap())]);
+        assert!(load_with(&e).is_err(), "Dangling symlink read as no file");
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[test]

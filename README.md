@@ -373,7 +373,8 @@ Without `LSFGM_ENV` the configuration comes from a TOML file. The path is chosen
 
 If the chosen file does not exist and `LSFGM_CONFIG` was set, loading fails with
 `LSFGM_CONFIG is set but file does not exist: <path>`. Otherwise the built-in default file is
-written to that path (creating parent directories) and used.
+written to that path (creating parent directories) and used. A symlink there whose target is missing
+is an error, never replaced by the default.
 
 Any configuration error in either mode (unparseable file, bad value, unwritable default path) is
 logged as `lsfg-metal shim: failed to initialize, passing through:` followed by `- <error>`, and the
@@ -423,10 +424,10 @@ Supported subset of TOML:
   1 is accepted here and disables generation; environment mode is stricter and requires 2 to 4.
 
 Reload on change: on the Vulkan fixed present path the shim stats the config file at every present
-and records its modification time as `(seconds, nanoseconds)`. When the mtime changes it reparses,
-logs `Config file changed on disk, reloading...`, and adopts the profile with the **same name** as
-the active one. If that name is gone the old profile is kept. A parse failure leaves the recorded mtime
-untouched, so the next present retries the same file; this is what covers a half-written file. The
+and records its modification time and size. When either changes it reparses, logs
+`Config file changed on disk, reloading...`, and adopts the profile with the **same name** as the
+active one. If that name is gone the old profile is kept. A file that fails to parse is not read again
+until its modification time or size changes; this is what covers a half-written file. The
 watcher is not created when `LSFGM_ENV` is set. Only `flow_scale` and `performance_mode` are baked
 into the pipeline, so only those two rebuild it on reload; a new `multiplier` is re-read on the next
 present and costs nothing beyond the extra inner passes it allocates. `override_present_mode` and
@@ -692,19 +693,20 @@ Review the diff and rebuild.
 
 ## Testing
 
-**Unit tests.** 37 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
+**Unit tests.** 38 tests, `cargo test --release`; only the OpenGL one needs a GPU session. Set
 `LSFGM_TEST_DLL=/path/to/lsfg-vk.dll` to make the PE resource test parse a real file; without it
 that test passes vacuously. They cover the pacer (trust rule, locking, fractional ratios, simple
 fractions ending on the original, cap behaviour, untrusted runs and probing, a present thread
 blocked for the whole interval, invalid intervals, the hitch floor on a fast display, a closed-loop
 convergence model), the settings library (environment mode, `auto` flow scale and a repeated
-`flow_scale` key, config path precedence, a missing config file, TOML round trip and `~` expansion,
-error messages, profile identification order including the kill switch, executable-name matching
-and the catch-all profile, reload on mtime change), the refresh-interval conversion, the PE resource
-walk, the DLL path fix-up, the feature-chain copy, memory type selection, the memory planner, the
-pipeline signature tables, the 64-pixel minimum frame size, the recursive mutex, half-float
-conversion, the latency probe's percentiles, the layer colour classification (storage and colour
-kind per pixel format and colour space) and the OpenGL state restore.
+`flow_scale` key, config path precedence, a missing config file and a dangling symlink, TOML round
+trip and `~` expansion, error messages, profile identification order including the kill switch,
+executable-name matching and the catch-all profile, reload on change), the refresh-interval
+conversion, the PE resource walk, the DLL path fix-up, the feature-chain copy, memory type
+selection, the memory planner, the pipeline signature tables, the 64-pixel minimum frame size, the
+recursive mutex, half-float conversion, the latency probe's percentiles, the layer colour
+classification (storage and colour kind per pixel format and colour space) and the OpenGL state
+restore.
 
 **`validate`.** Runs the generator on a real driver with synthetic input and reports timings and the
 centre pixel of the last generated frame.
