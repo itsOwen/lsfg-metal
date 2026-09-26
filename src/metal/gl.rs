@@ -119,6 +119,8 @@ pub fn install() {
     else {
         return;
     };
+    // the vblank clock starts now, so it has ticked by the first swap
+    let _ = vblank_period();
     let _ = FLUSH.set(unsafe { std::mem::transmute::<Imp, FlushFn>(m.implementation()) });
     unsafe {
         m.set_implementation(std::mem::transmute::<*const (), Imp>(
@@ -160,7 +162,7 @@ struct Context {
     engine: Engine,
     pacer: Option<Pacer>,
     estimator: Estimator,
-    // seconds the game spent in generated swaps during the previous frame
+    // seconds the game waited in our swaps during the previous frame
     held: f64,
     stats: Stats,
     up: Option<Up>,
@@ -207,6 +209,124 @@ unsafe impl Send for Front {}
 
 // one lock for every gl context; per-context locks if two contexts ever swap at once
 static FRONT: Mutex<Option<Front>> = Mutex::new(None);
+
+// the display refresh our swaps are spaced by, read again when a context is rebuilt
+static REFRESH: Mutex<Option<f64>> = Mutex::new(None);
+// the vblank our previous swap shows at, on the host clock; without a display link, when it went out
+static SHOWN_AT: Mutex<f64> = Mutex::new(0.0);
+
+#[repr(C)]
+struct CVTimeStamp {
+    version: u32,
+    video_time_scale: i32,
+    video_time: i64,
+    host_time: u64,
+}
+
+type CVOutput = unsafe extern "C" fn(*mut c_void, *const CVTimeStamp, *const CVTimeStamp, u64, *mut u64, *mut c_void) -> i32;
+
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    fn CVDisplayLinkCreateWithActiveCGDisplays(link: *mut *mut c_void) -> i32;
+    fn CVDisplayLinkSetOutputCallback(link: *mut c_void, cb: Option<CVOutput>, ctx: *mut c_void) -> i32;
+    fn CVDisplayLinkStart(link: *mut c_void) -> i32;
+}
+
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+}
+
+// host ticks to seconds, the clock display link timestamps use
+fn host_secs(ticks: u64) -> f64 {
+    static RATIO: OnceLock<f64> = OnceLock::new();
+    let r = *RATIO.get_or_init(|| {
+        let mut tb = [0u32; 2];
+        unsafe { mach_timebase_info(&mut tb) };
+        if tb[1] == 0 {
+            1e-9
+        } else {
+            tb[0] as f64 / tb[1] as f64 * 1e-9
+        }
+    });
+    ticks as f64 * r
+}
+
+// the next vblank the display link announced and the period between its announcements, as f64 bits; zero until it ticks
+static VBLANK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERIOD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+unsafe extern "C" fn vblank(_: *mut c_void, _: *const CVTimeStamp, out: *const CVTimeStamp, _: u64, _: *mut u64, _: *mut c_void) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let next = host_secs((*out).host_time);
+    let gap = next - f64::from_bits(VBLANK.swap(next.to_bits(), Relaxed));
+    // one refresh apart; a missed callback or the first one leaves the period as it was
+    if gap > 0.002 && gap < 0.05 {
+        PERIOD.store(gap.to_bits(), Relaxed);
+    }
+    0
+}
+
+// the main display's vblank period, once a display link runs and has ticked twice; none where there is no link
+fn vblank_period() -> Option<f64> {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    let started = *STARTED.get_or_init(|| unsafe {
+        let mut link = std::ptr::null_mut();
+        if CVDisplayLinkCreateWithActiveCGDisplays(&mut link) != 0 || link.is_null() {
+            return false;
+        }
+        CVDisplayLinkSetOutputCallback(link, Some(vblank), std::ptr::null_mut());
+        // the link lives as long as the process
+        CVDisplayLinkStart(link) == 0
+    });
+    let p = f64::from_bits(PERIOD.load(std::sync::atomic::Ordering::Relaxed));
+    (started && p > 0.0).then_some(p)
+}
+
+// the first vblank at or after `t`
+fn next_vblank(t: f64, period: f64) -> f64 {
+    let base = f64::from_bits(VBLANK.load(std::sync::atomic::Ordering::Relaxed));
+    base + ((t - base) / period).ceil() * period
+}
+
+// gl swaps burst past swap interval 1 and a vblank shows only the last, so each waits out the previous one's vblank
+fn spaced(present: &impl Fn()) {
+    let refresh = *REFRESH.lock().unwrap().get_or_insert_with(display_refresh);
+    let mut shown = SHOWN_AT.lock().unwrap();
+    // on the vblank grid when the target is the display's own rate; LSFGM_TARGET_FPS below it spaces by time
+    let grid = vblank_period().filter(|p| (p - refresh).abs() < refresh * 0.05);
+    // said once, a second in, when the link has had time to tick
+    static SAID: std::sync::Once = std::sync::Once::new();
+    static FIRST: OnceLock<f64> = OnceLock::new();
+    if now() - *FIRST.get_or_init(now) > 1.0 {
+        SAID.call_once(|| match grid {
+            Some(p) => log::info(&format!("OpenGL swaps paced on the display's vblank every {:.2} ms", p * 1e3)),
+            None => log::info(&format!("OpenGL swaps paced every {:.2} ms, without the display's vblank", refresh * 1e3)),
+        });
+    }
+    match grid {
+        Some(period) => {
+            let host = || host_secs(unsafe { mach_absolute_time() });
+            // just past the vblank that shows the previous swap, so this one lands on the next
+            let wait = *shown + 0.001 - host();
+            if wait > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+            }
+            // a swap needs a few milliseconds before a vblank to make it
+            let at = next_vblank(host() + 0.003, period);
+            present();
+            *shown = at;
+        }
+        None => {
+            let wait = *shown + refresh * 0.95 - now();
+            if wait > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+            }
+            present();
+            *shown = now();
+        }
+    }
+}
 
 unsafe extern "C-unwind" fn flush_hook(this: *mut AnyObject, sel: Sel) {
     let orig = *FLUSH.get().unwrap();
@@ -338,6 +458,20 @@ unsafe fn generate(
         return Ok(());
     }
     let upscale = p.scaler == ScalerMode::MetalFx && shown.0 > extent.0 && shown.1 > extent.1;
+    // every frame, also while the context builds: the game or wine can reset the swap interval
+    if p.override_present_mode {
+        CGLSetParameter(cgl, CGL_SWAP_INTERVAL, &1);
+    }
+    // with vsync forced, every frame we present is held to the display's rate; returns how long the game waited
+    let swap = || {
+        let from = now();
+        if p.override_present_mode {
+            spaced(&present)
+        } else {
+            present()
+        }
+        now() - from
+    };
     // multiplier 1 only upscales: the game's frame through metalfx, no generator
     if p.multiplier < 2 {
         if front.plain.get(&key).is_none_or(|(e, s, _)| (*e, *s) != (extent, shown)) {
@@ -370,14 +504,11 @@ unsafe fn generate(
         u.pin(cgl);
         u.show(&src.texture)?;
         drop(saved);
-        present();
+        swap();
         return Ok(());
     }
-    // every frame, also while the context builds: the game or wine can reset the swap interval
-    if p.override_present_mode {
-        CGLSetParameter(cgl, CGL_SWAP_INTERVAL, &1);
-    }
     if front.contexts.get(&key).is_none_or(|c| c.extent != extent) {
+        *REFRESH.lock().unwrap() = None;
         if let Some(old) = front.contexts.remove(&key) {
             old.destroy(front.backend.as_ref());
         }
@@ -407,9 +538,13 @@ unsafe fn generate(
         front.contexts.insert(key, c);
     }
     let c = front.contexts.get_mut(&key).unwrap();
-    // time held in generated swaps makes the sample untrusted; the pacer then probes with the original alone
+    // the game waited in our swaps for the display; without that time the interval is how fast the game itself goes
     let blocked = std::mem::take(&mut c.held);
-    let sample = c.estimator.sample(entered, blocked);
+    let raw = c.estimator.sample(entered, blocked);
+    let sample = Sample {
+        interval: (raw.interval - blocked).max(0.0),
+        trusted: raw.interval > 0.0,
+    };
     pace_debug(sample, blocked);
     let m = p.multiplier;
     let slots: Vec<f64> = match &mut c.pacer {
@@ -456,7 +591,7 @@ unsafe fn generate(
             }
         }
     }
-    let held_from = now();
+    let mut held = 0.0;
     for (i, &ts) in slots.iter().take(inserted).enumerate() {
         match &mut c.engine {
             Engine::Native(n) => {
@@ -483,20 +618,20 @@ unsafe fn generate(
         c.show(1 + i, extent)?;
         if i + 1 == inserted && !show_original {
             drop(saved);
-            present();
+            held += swap();
             c.stats.generated += 1;
-            c.held = now() - held_from;
+            c.held = held;
             c.count_source();
             return Ok(());
         }
-        present();
+        held += swap();
         c.stats.generated += 1;
     }
-    c.held = now() - held_from;
     // the back buffer is undefined after a swap, so the original frame comes back from its copy
     c.show(0, extent)?;
     drop(saved);
-    present();
+    held += swap();
+    c.held = held;
     c.stats.original += 1;
     c.count_source();
     Ok(())

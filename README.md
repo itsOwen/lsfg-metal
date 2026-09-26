@@ -109,8 +109,12 @@ Metal hooks, or alone with `LSFGM_OPENGL=1`, which leaves `CAMetalLayer` untouch
 whose layers belong to a Vulkan driver. It swizzles `-[NSOpenGLContext flushBuffer]`, blits the
 back buffer into an `IOSurface` shared with the generator, and blits each generated frame back into
 the back buffer before calling the original swap. The game's framebuffer bindings, read buffer,
-scissor and sRGB state are restored before it continues. Adaptive pacing works here too; the time
-spent in generated swaps is fed back to the estimator.
+scissor and sRGB state are restored before it continues. With vsync forced (the default), each swap
+the front end makes waits until the vblank the previous one lands on has passed, timed by a display
+link on the main display: macOS lets OpenGL swaps through in bursts even at swap interval 1, and a
+vblank shows only the last of them. Without a display link, or when `LSFGM_TARGET_FPS` is not the
+display's own rate, swaps are spaced a refresh interval apart instead. Adaptive pacing works here
+too; the pacer sees the game's interval without the time the game waited in those swaps.
 
 On an Apple silicon GPU the Metal front end, the Vulkan proxy swapchain and the OpenGL front end
 generate natively on Metal. When a context is built, for a new size or format, the shim translates
