@@ -17,7 +17,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue,
     MTL4RenderPassDescriptor, MTLClearColor, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
-    MTLLoadAction, MTLPixelFormat, MTLStoreAction,
+    MTLLoadAction, MTLPixelFormat, MTLSharedEvent, MTLStoreAction,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
@@ -87,6 +87,9 @@ fn render(
     let queue = device.newMTL4CommandQueue().expect("mtl4 queue");
     let allocator = device.newCommandAllocator().expect("command allocator");
     let cb = device.newCommandBuffer().expect("mtl4 command buffer");
+    // the allocator is reset only once the gpu is done with the previous frame's commands
+    let done = device.newSharedEvent().expect("shared event");
+    let mut committed = 0u64;
     let start = Instant::now();
     let mut shown = 0;
     for i in 0..frames {
@@ -95,6 +98,7 @@ fn render(
             let Some(drawable) = layer.nextDrawable() else {
                 return;
             };
+            done.waitUntilSignaledValue_timeoutMS(committed, u64::MAX);
             allocator.reset();
             cb.beginCommandBufferWithAllocator(&allocator);
             let pass = MTL4RenderPassDescriptor::new();
@@ -117,6 +121,8 @@ fn render(
             queue.waitForDrawable(d);
             let mut one = NonNull::from(&*cb);
             unsafe { queue.commit_count(NonNull::from(&mut one), 1) };
+            committed += 1;
+            queue.signalEvent_value(ProtocolObject::from_ref(&*done), committed);
             queue.signalDrawable(d);
             d.present();
             shown += 1;
