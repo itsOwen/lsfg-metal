@@ -55,11 +55,12 @@ Three hooks cover the renderers a Wine bottle can use:
   8-bit does: 10-bit layers are stored as `RGB10A2Unorm` (exact), the XR formats as `BGR10_XR`
   (exact), gamma-encoded float (for example `kCGColorSpaceExtendedSRGB`, as Unity 2021 presents
   on Apple Arcade) as the shared-exponent `RGB9E5Float` (9-bit precision, values above 1.0 kept,
-  negative out-of-gamut values clipped to 0), and linear HDR (scRGB, extended linear Display P3)
-  as `RGBA16Float`, as before. A colour space is linear when Core Graphics linearizes it to itself
-  or its name contains `Linear`; one with no name counts as gamma-encoded. That picks the colour
-  kind the shaders' luma pre-pass reads: encoded values as they are, linear SDR through a 2.2 gamma,
-  linear HDR as scRGB. The log's `Metal presentation` line names the storage and the colour kind.
+  negative out-of-gamut values clipped to 0; linear SDR float is stored the same way), and linear
+  HDR (scRGB, extended linear Display P3) as `RGBA16Float`, as before. A colour space is linear when
+  Core Graphics linearizes it to itself or its name contains `Linear`; a layer with no colour space
+  counts as gamma-encoded. That picks the colour kind the shaders' luma pre-pass reads: encoded
+  values as they are, linear SDR through a 2.2 gamma, linear HDR as scRGB. The log's
+  `Metal presentation` line names the storage and the colour kind.
 * Measured on an M2 with `validate --native --store`, 200 iterations: 1080p 7.50 ms (RGBA8), 7.43
   (RGB10A2), 7.46 (RGB9E5), 7.48 (BGR10_XR), 7.88 (RGBA16F); 1440p 12.80, 12.79, 12.78, 12.82,
   13.51. Against a half-float reference of the same `mtlclear` scene, 10-bit layers generate
@@ -136,7 +137,8 @@ That time goes back to the game when the GPU is the limit: the native Valheim at
 with none natively. A game already at the display-locked rate keeps the same frame rate, latency and
 pacing (Codename CURE II on DXMT and DXVK). If the native generator cannot be built, for example
 because a shader does not translate or the GPU is not Apple silicon, the shim logs
-`Native Metal generator unavailable (<why>); using MoltenVK` and generates on MoltenVK instead; `LSFGM_NATIVE=0` asks for that directly. Intel and AMD GPUs therefore always generate on
+`Native Metal generator unavailable (<why>); using MoltenVK` and generates on MoltenVK instead;
+`LSFGM_NATIVE=0` asks for that directly. Intel and AMD GPUs therefore always generate on
 MoltenVK, and neither generator has been tested on one. The Vulkan fixed present path generates
 inside the game's own Vulkan device and always stays on MoltenVK.
 
@@ -355,7 +357,7 @@ variable.
 
 Validation errors in environment mode: `Invalid LSFGM_MULTIPLIER`,
 `The macOS shim supports multipliers from 2 to 4`, `LSFGM_MULTIPLIER must be greater than 1`,
-`LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto`.
+`LSFGM_FLOW_SCALE must be between 0.25 and 1.0, or auto`, `Unrecognized pacing mode: <value>`.
 
 When `LSFGM_DLL_PATH` is unset the shader package is looked for in Steam under `HOME`, then in
 Steam inside the Wine prefix named by `WINEPREFIX`, then in the working directory. A launcher
@@ -454,8 +456,8 @@ Profile selection order:
 3. Executable name: the first profile whose `active_in` contains, case-insensitively, any
    `.exe` on the process's command line (this is where Wine keeps the Windows executable path,
    so it works in CrossOver bottles and outside Steam), the executable's own file name, or the
-   name of the `.app` bundle it sits in, without the `.app` suffix and only for the exact
-   `<name>.app/Contents/MacOS/<binary>` layout. Method *executable name*.
+   name of the `.app` bundle it sits in, without the `.app` suffix, when the binary sits three
+   levels under a `<name>.app` directory. Method *executable name*.
 4. `SteamAppId` non-empty: the first profile whose `active_in` contains exactly that string,
    method *Steam App ID*.
 5. The first profile whose `active_in` contains `"*"`, method *catch-all profile*. It is checked
@@ -674,11 +676,13 @@ name up in the real driver on its first call and jumps there. Without them a lib
 MoltenVK fails to load; GStreamer's `applemedia` plugin, which decodes video, stops with
 `Symbol not found: _mvkMTLPixelFormatFromVkFormat`. A caller that binds a forwarded Vulkan function by
 symbol bypasses the hooks, exactly as it would with the driver alone; the hooks see what goes through
-the two `ProcAddr` functions and the shim's own exports. The `vk_icd*` loader entry points are never forwarded, since a loader prefers
-them over `vkGetInstanceProcAddr`. With no driver beside the shim (injected into a native game) a
-forwarder takes the name from the first loaded image that is not a copy of the shim. A name the driver
-lacks, or any name when the driver fails to load, aborts on its first call with a log line naming it. The list is the union of the MoltenVK builds
-in Highball, CrossOver, GStreamer, Cemu and Wine; regenerate it when a newer MoltenVK adds names.
+the two `ProcAddr` functions and the shim's own exports. The `vk_icd*` loader entry points are
+never forwarded, since a loader prefers them over `vkGetInstanceProcAddr`. With no driver beside
+the shim (injected into a native game) a forwarder takes the name from the first loaded image that
+is not a copy of the shim. A name the driver lacks,
+or any name when the driver fails to load, aborts on its first call with a log line naming it. The
+list is the union of the MoltenVK builds in Highball, CrossOver, GStreamer, Cemu and Wine;
+regenerate it when a newer MoltenVK adds names.
 
 The forwarders are assembly, outside `rustc`'s export list for a `cdylib`, so `build.rs` adds the
 `_vk*` and `_mvk*` patterns with `-exported_symbol`. `objc2`'s class data statics and the
@@ -739,8 +743,9 @@ mode, only the milliseconds are.
 files and running the two iterations that put one frame in each source layer. With `--out dir` each
 generated frame of the second iteration is written there as `generated_<k>.ppm`, which makes an
 interpolation regression a `cmp` against a golden directory. The readback and the file write happen
-inside the timed section, so ignore the milliseconds when `--out` is used. Binary (P6) 8-bit PPM only, so `--in`
-and `--hdr` are mutually exclusive. For a 40-pixel square moved 120 pixels between the two inputs,
+inside the timed section, so ignore the milliseconds when `--out` is used. Binary (P6) 8-bit PPM
+only, so `--in` and `--hdr` are mutually exclusive. For a 40-pixel square moved 120 pixels between
+the two inputs,
 `-m 4` writes it at +30, +60 and +90.
 
 With `LSFGM_GPU_PROFILE` set, a normal (not `--bench`) run also prints the GPU time of every stage,
@@ -759,7 +764,8 @@ run has no caller side to drop (it is still refused with `--out`). Both runs ref
 size under the 64-pixel minimum after flow scaling.
 
 **`doctor`.** Checks an install without launching a game. Every check prints one `ok`, `warn` or
-`FAIL` line; exit 1 if any check failed, 0 otherwise, so a `warn` alone still exits 0.
+`FAIL` line; exit 1 if any check failed, 0 otherwise, so a `warn` alone still exits 0; a bad
+argument exits 2.
 
 ```
 usage: doctor [--shim libMoltenVK.dylib] [--dll lsfg-vk.dll] [--app the-binary-that-is-injected]
@@ -774,17 +780,19 @@ is the shim again. Without `--shim` it still checks the driver named by `LSFGM_M
 loads that driver, reports its version and **fails** when it is older than MoltenVK 1.3 or when
 `VK_EXT_metal_objects`, which the proxy path and generation on MoltenVK need, is missing. On an
 Apple silicon GPU (unless `LSFGM_NATIVE=0`) either one is only a `warn`, since the native generator
-needs neither; a MoltenVK 1.2.10 such as CrossOver's is such a case. It then classifies what a
+needs neither; a MoltenVK 1.2.10 such as CrossOver's is such a case. It also classifies what a
 leaf-name lookup of `libMoltenVK.dylib` on `DYLD_LIBRARY_PATH` would find (the shim there is the
 normal launcher install and passes; a real MoltenVK there shadows the shim and warns), parses the
 shader DLL and counts modules, checks that the pipeline cache directory of generation on MoltenVK
 is writable, and prints the config file and the profile that matches doctor's own process.
-Discovery of the DLL looks inside `WINEPREFIX`, which a launcher sets and a shell does not, so a missing DLL is a `warn`, not a failure; a DLL that
+Discovery of the DLL looks inside `WINEPREFIX`, which a launcher sets and a shell does not, so a
+missing DLL is a `warn`, not a failure; a DLL that
 is not named `lsfg-vk.dll` is a failure, because the default Steam branch ships DXBC shaders that
 parse but cannot generate. With `--app` it runs `codesign` on the binary that is actually injected
 (under Wine that is the engine's `wine`/`wineloader`, not the `.app` the user clicks) and fails
-when the hardened runtime, library validation or the restrict flag is set without
-`disable-library-validation` or `allow-dyld-environment-variables`; a path under SIP warns instead,
+when the restrict flag is set, or when the hardened runtime or library validation is set without
+the entitlements that waive them (`allow-dyld-environment-variables` or `get-task-allow`, and
+`disable-library-validation`); a path under SIP warns instead,
 since dyld drops `DYLD_*` there whatever the signature says. Because `--shim` loads the shim into
 doctor's own process, doctor sets the kill switch on itself first, so the shim's initializer arms
 nothing.
@@ -827,7 +835,8 @@ visible. `MTLTEST_FPS` paces the source rate; `MTLTEST_MINDURATION=<fps>` presen
 `MTLPixelFormat` value for the layer (the square is only drawn for BGRA8), `MTLTEST_COLORSPACE`
 a Core Graphics colour space name (for example `kCGColorSpaceExtendedSRGB`), `MTLTEST_SCALE`
 multiplies the clear colour (above 1 or below 0 for the extended formats), and `MTLTEST_DOUBLE`
-presents a second layer on the same command buffer. It needs the shim injected:
+presents a second layer on the same command buffer. `MTLTEST_DIRECT` commits and then presents the
+drawable directly, ignoring `MTLTEST_MINDURATION`. It needs the shim injected:
 
 ```sh
 DYLD_INSERT_LIBRARIES=dist/renderers/lsfg/libMoltenVK.dylib LSFGM_METAL=1 \
@@ -837,11 +846,17 @@ cargo run --release --example mtlclear -- 240
 ```
 
 A correct run logs `lsfg-metal metal front end active` and a
-`Metal presentation <w>x<h> (<format>), <multiplier m|adaptive up to m>, display <n> Hz, flow <f>` line,
+`Metal presentation <w>x<h> (pixel format <n>[ srgb], stored <store>, colour kind <k>), <multiplier m|adaptive up to m>, display <n> Hz, flow <f>`
+line,
 streams `Frame generation stats` with `source`, `original` and `generated` all advancing, and
 prints `<n> frames in <s>s = <f> fps` at the end. On 60 Hz that rate is about 30 at 2x, 20 at 3x and
 15 at 4x. With `MTLTEST_FPS=45 LSFGM_PACING_MODE=adaptive LSFGM_MULTIPLIER=4` the stats line shows
 `slots=1:40 2:20`.
+
+**`mtl4clear`.** `cargo run --release --example mtl4clear -- [frames]`. The same clear presented
+through Metal 4: the queue waits on and signals the drawable, and the drawable is presented
+directly, as D3DMetal 4 does. `MTL4TEST_FPS` paces the source rate; `MTL4TEST_WIDTH` and
+`MTL4TEST_HEIGHT` size the window. It needs the shim injected, like `mtlclear`.
 
 Run the native examples with the `DYLD_*` variables set directly. Never wrap them in `arch`, `env`,
 `perl` or another SIP-protected binary: those strip `DYLD_*` from the environment they pass on.
