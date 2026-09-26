@@ -492,6 +492,8 @@ Slots are fitted against the display refresh interval:
 * After 60 consecutive untrusted samples the pacer probes: every frame gets one slot until it has
   collected four trusted samples. It drops the first, which carries the game's catch-up after the
   held frames, and the median of the other three replaces the estimate outright, without smoothing.
+  If four untrusted frames arrive first, as with a present thread that is always blocked, the probe
+  ends and the cadence estimate stays.
 * If `estimate / refresh` is within 0.1 of a whole number, or rounds to at least the cap, the pacer
   locks to that many evenly spaced slots (`1/n .. n/n`). A game at or above the refresh rate gets
   `[1]` and is left alone.

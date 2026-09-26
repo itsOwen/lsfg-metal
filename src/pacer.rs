@@ -124,7 +124,12 @@ impl Pacer {
             {
                 self.estimate = self.cadence;
             }
-            if self.untrusted >= PROBE_AFTER || self.probing > 0 {
+            // a present thread blocked through the whole probe never yields a trusted sample
+            if self.probing as usize >= PROBE_SAMPLES {
+                self.probing = 0;
+                self.probes.clear();
+                self.untrusted = 0;
+            } else if self.untrusted >= PROBE_AFTER || self.probing > 0 {
                 self.probing += 1;
                 return self.lock(1);
             }
@@ -429,6 +434,11 @@ mod tests {
         // the cap of three, less one short probe
         assert!(n >= 150, "{n}");
         assert_eq!(p.interval(), 0.043);
+        // at 45 fps on 60 hz the probe's one slot never falls behind, so it must end on its own
+        let mut p = Pacer::new(REFRESH, 4);
+        total(&mut p, untrusted(1.0 / 45.0), 120);
+        let n = total(&mut p, untrusted(1.0 / 45.0), 60);
+        assert!(n >= 75, "{n}");
     }
 
     #[test]
