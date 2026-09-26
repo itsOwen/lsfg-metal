@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")/.."
 out=dist/renderers/lsfg
 # without LSFGM_VERSION, git describe rewritten to build.rs's <tag>.r<commits>.g<sha>[-dirty]
-version="${LSFGM_VERSION:-$(git describe --tags --always --dirty 2>/dev/null | sed -E 's/-([0-9]+)-g([0-9a-f]+)(-dirty)?$/.r\1.g\2\3/' | grep . || echo 0.8.0)}"
+version="${LSFGM_VERSION:-$(git describe --tags --always --dirty 2>/dev/null | sed -E 's/-([0-9]+)-g([0-9a-f]+)(-dirty)?$/.r\1.g\2\3/' | grep . || echo 0.9.0-beta.1)}"
 # the arm64 build packages the same way; the caller picks which one is already built
 target="${LSFGM_TARGET:-x86_64-apple-darwin}"
 rm -rf "$out"
