@@ -7,6 +7,7 @@ use super::chain_sizes::SIZES;
 
 pub struct Chain {
     pub head: *mut c_void,
+    pub fp16: bool,
     _nodes: Vec<Box<[u64]>>,
 }
 
@@ -28,19 +29,57 @@ unsafe fn prepend<T>(nodes: &mut Vec<Box<[u64]>>, head: &mut *mut c_void, value:
     nodes.push(b);
 }
 
-// an unknown sType ends the deep copy: the rest of the caller's chain is borrowed as is (never written),
-// and any of the five feature structs behind it counts as absent, so our own copy is prepended instead
-pub unsafe fn copy(p_next: *const c_void, fp16: bool) -> Chain {
+// past an unknown sType the caller's chain is only read: a feature struct there is kept (sTypes must be unique) and what it leaves off stays off
+pub unsafe fn copy(p_next: *const c_void, fp16: bool) -> Result<Chain, String> {
     use vk::StructureType as S;
     let mut nodes = Vec::new();
     let mut head: *mut c_void = std::ptr::null_mut();
     let mut tail: *mut *mut c_void = &mut head;
-    let (mut sync2, mut f16, mut timeline) = (false, false, false);
+    // none: no struct for it in the chain; some: whether the feature ends up on
+    let (mut sync2, mut f16, mut timeline) = (None, None, None);
     let mut p = p_next.cast::<vk::BaseInStructure>();
     while !p.is_null() {
         let st = (*p).s_type;
         let Some(size) = SIZES.iter().find(|(t, _)| *t == st).map(|(_, s)| *s) else {
             *tail = p.cast_mut().cast();
+            while !p.is_null() {
+                match (*p).s_type {
+                    S::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES => {
+                        sync2 = Some(
+                            (*p.cast::<vk::PhysicalDeviceVulkan13Features>()).synchronization2
+                                == vk::TRUE,
+                        );
+                    }
+                    S::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
+                        let f = &*p.cast::<vk::PhysicalDeviceVulkan12Features>();
+                        timeline = Some(f.timeline_semaphore == vk::TRUE);
+                        f16 = Some(f.shader_float16 == vk::TRUE);
+                    }
+                    S::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES => {
+                        sync2 = Some(
+                            (*p.cast::<vk::PhysicalDeviceSynchronization2Features>())
+                                .synchronization2
+                                == vk::TRUE,
+                        );
+                    }
+                    S::PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES => {
+                        f16 = Some(
+                            (*p.cast::<vk::PhysicalDeviceShaderFloat16Int8Features>())
+                                .shader_float16
+                                == vk::TRUE,
+                        );
+                    }
+                    S::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
+                        timeline = Some(
+                            (*p.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures>())
+                                .timeline_semaphore
+                                == vk::TRUE,
+                        );
+                    }
+                    _ => {}
+                }
+                p = (*p).p_next;
+            }
             break;
         };
         let mut b = alloc(size);
@@ -52,7 +91,7 @@ pub unsafe fn copy(p_next: *const c_void, fp16: bool) -> Chain {
         match st {
             S::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES => {
                 (*node.cast::<vk::PhysicalDeviceVulkan13Features>()).synchronization2 = vk::TRUE;
-                sync2 = true;
+                sync2 = Some(true);
             }
             S::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
                 let f = node.cast::<vk::PhysicalDeviceVulkan12Features>();
@@ -60,56 +99,63 @@ pub unsafe fn copy(p_next: *const c_void, fp16: bool) -> Chain {
                 if fp16 {
                     (*f).shader_float16 = vk::TRUE;
                 }
-                timeline = true;
-                f16 = true;
+                timeline = Some(true);
+                f16 = Some(true);
             }
             S::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES => {
                 (*node.cast::<vk::PhysicalDeviceSynchronization2Features>()).synchronization2 =
                     vk::TRUE;
-                sync2 = true;
+                sync2 = Some(true);
             }
             S::PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES => {
                 if fp16 {
                     (*node.cast::<vk::PhysicalDeviceShaderFloat16Int8Features>()).shader_float16 =
                         vk::TRUE;
                 }
-                f16 = true;
+                f16 = Some(true);
             }
             S::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
                 (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures>()).timeline_semaphore =
                     vk::TRUE;
-                timeline = true;
+                timeline = Some(true);
             }
             _ => {}
         }
         nodes.push(b);
         p = (*p).p_next;
     }
-    if !sync2 {
+    if sync2 == Some(false) || timeline == Some(false) {
+        return Err(
+            "The app's device features turn synchronization2 or timeline semaphores off".into(),
+        );
+    }
+    let fp16 = fp16 && f16 != Some(false);
+    if sync2.is_none() {
         prepend(
             &mut nodes,
             &mut head,
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true),
         );
     }
-    if !f16 && fp16 {
+    if f16.is_none() && fp16 {
         prepend(
             &mut nodes,
             &mut head,
             vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true),
         );
     }
-    if !timeline {
+    if timeline.is_none() {
         prepend(
             &mut nodes,
             &mut head,
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true),
         );
     }
-    Chain {
+    Ok(Chain {
         head,
+        fp16,
         _nodes: nodes,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -134,7 +180,8 @@ mod tests {
             p_next: (&mut f12 as *mut vk::PhysicalDeviceVulkan12Features).cast(),
             ..Default::default()
         };
-        let chain = unsafe { copy((&f2 as *const vk::PhysicalDeviceFeatures2).cast(), true) };
+        let chain =
+            unsafe { copy((&f2 as *const vk::PhysicalDeviceFeatures2).cast(), true) }.unwrap();
         let nodes = unsafe { walk(chain.head) };
         let types: Vec<_> = nodes.iter().map(|n| n.0).collect();
         assert_eq!(
@@ -152,7 +199,8 @@ mod tests {
         );
         assert_eq!((f12.timeline_semaphore, f12.shader_float16), (0, 0));
         f2.p_next = std::ptr::null_mut();
-        let chain = unsafe { copy((&f2 as *const vk::PhysicalDeviceFeatures2).cast(), false) };
+        let chain =
+            unsafe { copy((&f2 as *const vk::PhysicalDeviceFeatures2).cast(), false) }.unwrap();
         let types: Vec<_> = unsafe { walk(chain.head) }.iter().map(|n| n.0).collect();
         assert_eq!(
             types,
@@ -164,11 +212,14 @@ mod tests {
         );
     }
 
-    // features2 (copied) -> unknown (borrowed, with the vulkan 1.2 features behind it left alone and re-added at the head)
+    // features2 (copied) -> unknown (borrowed, with the vulkan 1.2 features behind it read, never duplicated)
     #[test]
     fn borrows_from_the_first_unknown_node() {
         use vk::StructureType as S;
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f12 = vk::PhysicalDeviceVulkan12Features {
+            timeline_semaphore: vk::TRUE,
+            ..Default::default()
+        };
         let mut bogus = vk::BaseInStructure {
             s_type: S::APPLICATION_INFO,
             p_next: (&mut f12 as *mut vk::PhysicalDeviceVulkan12Features).cast(),
@@ -178,23 +229,38 @@ mod tests {
             p_next: (&mut bogus as *mut vk::BaseInStructure).cast(),
             ..Default::default()
         };
-        let chain = unsafe { copy((&f2 as *const vk::PhysicalDeviceFeatures2).cast(), true) };
+        let chain =
+            unsafe { copy((&f2 as *const vk::PhysicalDeviceFeatures2).cast(), true) }.unwrap();
         let nodes = unsafe { walk(chain.head) };
         let types: Vec<_> = nodes.iter().map(|n| n.0).collect();
         assert_eq!(
             types,
             [
-                S::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
-                S::PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
                 S::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
                 S::PHYSICAL_DEVICE_FEATURES_2,
                 S::APPLICATION_INFO,
                 S::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
             ]
         );
-        assert_ne!(nodes[3].1, (&f2 as *const vk::PhysicalDeviceFeatures2).cast());
-        assert_eq!(nodes[4].1, (&bogus as *const vk::BaseInStructure).cast());
-        assert_eq!(nodes[5].1, (&f12 as *const vk::PhysicalDeviceVulkan12Features).cast());
-        assert_eq!((f12.timeline_semaphore, f12.shader_float16), (0, 0));
+        assert_ne!(
+            nodes[1].1,
+            (&f2 as *const vk::PhysicalDeviceFeatures2).cast()
+        );
+        assert_eq!(nodes[2].1, (&bogus as *const vk::BaseInStructure).cast());
+        assert_eq!(
+            nodes[3].1,
+            (&f12 as *const vk::PhysicalDeviceVulkan12Features).cast()
+        );
+        assert!(!chain.fp16);
+        assert_eq!((f12.timeline_semaphore, f12.shader_float16), (vk::TRUE, 0));
+        // timelines left off where the shim cannot write fails instead
+        unsafe {
+            (*bogus
+                .p_next
+                .cast_mut()
+                .cast::<vk::PhysicalDeviceVulkan12Features>())
+            .timeline_semaphore = vk::FALSE
+        };
+        assert!(unsafe { copy((&f2 as *const vk::PhysicalDeviceFeatures2).cast(), true) }.is_err());
     }
 }

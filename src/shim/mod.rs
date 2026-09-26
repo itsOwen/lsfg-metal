@@ -1116,7 +1116,8 @@ unsafe fn hooked_device(
         return Err("Device has no synchronization2 support".into());
     }
     let fp16 = f16_ext && f16.shader_float16 == vk::TRUE;
-    let chain = chain::copy(ci.p_next, fp16);
+    let chain = chain::copy(ci.p_next, fp16)?;
+    let fp16 = chain.fp16;
     let mut mci = *ci;
     mci.p_next = chain.head;
     mci.pp_enabled_extension_names = exts.as_ptr();
