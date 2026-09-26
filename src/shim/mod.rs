@@ -1210,6 +1210,10 @@ unsafe extern "system" fn destroy_device(
     let (entry, swapchains) = {
         let mut m = MAPS.write().unwrap();
         let Some(e) = m.devices.remove(&device) else {
+            drop(m);
+            if let Some(f) = forward::real::<vk::PFN_vkDestroyDevice>(c"vkDestroyDevice") {
+                f(device, alloc);
+            }
             return;
         };
         m.queues.retain(|_, d| *d != device);
@@ -1362,8 +1366,13 @@ unsafe extern "system" fn create_swapchain(
         error!("- {what}");
         vk::Result::ERROR_INITIALIZATION_FAILED
     };
+    // a device the shim did not register (headless, or made through the export) goes to the driver
     let Some(dev) = device_of(device) else {
-        return fail("Unknown device handle");
+        let real = real_device_fn::<vk::PFN_vkCreateSwapchainKHR>(device, c"vkCreateSwapchainKHR");
+        return match real {
+            Some(f) => f(device, info, alloc, out),
+            None => fail("Could not resolve vkCreateSwapchainKHR"),
+        };
     };
     let Some(real) =
         dfetch::<vk::PFN_vkCreateSwapchainKHR>(dev.gdpa, device, c"vkCreateSwapchainKHR")
@@ -1470,13 +1479,18 @@ unsafe extern "system" fn queue_present(
     if pi.swapchain_count == 0 || pi.p_swapchains.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let Some(entry) = swapchain_of(*pi.p_swapchains) else {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
-    };
+    let entry = swapchain_of(*pi.p_swapchains);
     let _api = API.lock();
     if pi.swapchain_count != 1 && proxy::invalidate_proxies(queue, pi) {
         return vk::Result::ERROR_OUT_OF_DATE_KHR;
     }
+    // a swapchain the shim never saw is on a device it did not register
+    let Some(entry) = entry else {
+        return match forward::real::<vk::PFN_vkQueuePresentKHR>(c"vkQueuePresentKHR") {
+            Some(f) => f(queue, info),
+            None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+        };
+    };
     let Some(w) = &entry.wrapper else {
         // a wrapped swapchain later in the array is presented natively too; say so once
         if pi.swapchain_count > 1 {
@@ -1524,8 +1538,12 @@ unsafe fn queue_call<T>(
     name: &CStr,
     call: impl FnOnce(T) -> vk::Result,
 ) -> vk::Result {
+    // a queue of a device the shim did not register goes straight to the driver
     let Some(dev) = queue_device(queue) else {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
+        return match forward::real::<T>(name) {
+            Some(f) => call(f),
+            None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+        };
     };
     let Some(real) = dfetch::<T>(dev.gdpa, dev.handle, name) else {
         return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
