@@ -637,7 +637,7 @@ Scripts/package.sh
 `THIRD_PARTY.txt`, writes `source.txt`, ad hoc signs the dylib with `codesign -s - -f`, and verifies
 the export list.
 
-Version string. Two independent steps derive one, and they use different rules.
+Version string. Two independent steps derive one, using the same format.
 
 * `build.rs` sets the compiled-in version, which is what the startup log line reports. It takes
   `LSFGM_VERSION` when that is set and non-empty. Otherwise it asks git for the short HEAD sha and
@@ -645,11 +645,13 @@ Version string. Two independent steps derive one, and they use different rules.
   with `unknown` in place of the tag when the repository has none, and `-dirty` appended when
   tracked files are modified. With no git at all it falls back to `0.8.0`.
 * `Scripts/package.sh` writes the version in `source.txt`. It takes `LSFGM_VERSION` when set,
-  otherwise `git describe --tags --always --dirty`, otherwise `0.8.0`.
+  otherwise `git describe --tags --always --dirty` rewritten to the same `<tag>.r<commits>.g<sha>`
+  form, otherwise `0.8.0`.
 
-The script does not build, so the compiled-in version and `source.txt` agree only when
-`LSFGM_VERSION` is exported for both the `cargo build` and the packaging step. Left to their own
-git queries the two produce different strings from the same commit.
+The script does not build, so the two agree only when the tree is unchanged between the
+`cargo build` and the packaging step, and the repository has a tag (without one, `build.rs` says
+`unknown.r<commits>.g<sha>` and the script just the sha). Export `LSFGM_VERSION` for both steps to
+pin it.
 
 Export check. The shim carries the driver's install name (`@rpath/libMoltenVK.dylib`), so anything
 linked against MoltenVK binds to it, and `package.sh` fails unless the text exports are exactly its own
